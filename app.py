@@ -391,23 +391,34 @@ def convert_layer(
     input_encoding: str | None,
     output_encoding: str,
     makevalid: bool = False,
-) -> tuple[bool, str]:
+) -> tuple[bool, Path, str]:
     ogr2ogr, _ = gdals()
     if not ogr2ogr:
-        return False, "ogr2ogr을 찾을 수 없습니다. GDAL 설치 후 다시 실행하세요."
-    args = [ogr2ogr, "-overwrite", "-f", ogr_output_format(output_format)]
-    if layer.kind == "SHP" and input_encoding:
-        args += ["-oo", f"ENCODING={input_encoding}"]
-    if source_epsg:
-        args += ["-s_srs", f"EPSG:{source_epsg}"]
-    if target_epsg:
-        args += ["-t_srs", f"EPSG:{target_epsg}"]
-    if makevalid:
-        args += ["-makevalid"]
-    if output_format == "SHP":
-        args += ["-lco", f"ENCODING={output_encoding}"]
-    args += [str(out_path), *ogr_source_args(layer)]
-    return run_cmd(args)
+        return False, out_path, "ogr2ogr을 찾을 수 없습니다. GDAL 설치 후 다시 실행하세요."
+
+    def build(fmt: str, target: Path) -> list[str]:
+        a = [ogr2ogr, "-overwrite", "-f", ogr_output_format(fmt)]
+        if layer.kind == "SHP" and input_encoding:
+            a += ["-oo", f"ENCODING={input_encoding}"]
+        if source_epsg:
+            a += ["-s_srs", f"EPSG:{source_epsg}"]
+        if target_epsg:
+            a += ["-t_srs", f"EPSG:{target_epsg}"]
+        if makevalid:
+            a += ["-makevalid"]
+        if fmt == "SHP":
+            a += ["-lco", f"ENCODING={output_encoding}"]
+        a += [str(target), *ogr_source_args(layer)]
+        return a
+
+    ok, log = run_cmd(build(output_format, out_path))
+    if ok or output_format == "GPKG":
+        return ok, out_path, log
+    # SHP 저장 실패 -> GPKG로 자동 대체(빈손 방지)
+    fallback = out_path.with_suffix(".gpkg")
+    ok2, log2 = run_cmd(build("GPKG", fallback))
+    note = "⚠️ SHP 저장에 실패해 GPKG로 대체했습니다(QGIS에서 동일하게 열립니다)."
+    return ok2, (fallback if ok2 else out_path), (log + "\n" + log2 + "\n" + note).strip()
 
 
 def convert_layer_safe(
@@ -448,19 +459,16 @@ def convert_layer_safe(
         return False, out_path, counts, "\n".join(logs)
     counts["복구후"] = ogr_layer_stats(work).get("features")
 
-    # ② 재투영 + 도형 복구
-    step_b = [ogr2ogr, "-overwrite", "-f", ogr_output_format(output_format), "-makevalid"]
+    # ② 재투영 + 도형 복구 (SHP 저장 실패 시 GPKG로 자동 대체)
+    extra_b = ["-makevalid", "-nlt", "PROMOTE_TO_MULTI"]
     if target_epsg:
-        step_b += ["-t_srs", f"EPSG:{target_epsg}"]
-    if output_format == "SHP":
-        step_b += ["-lco", f"ENCODING={output_encoding}"]
-    step_b += ["-nlt", "PROMOTE_TO_MULTI", str(out_path), str(work), "step"]
-    ok, log = run_cmd(step_b)
+        extra_b += ["-t_srs", f"EPSG:{target_epsg}"]
+    ok, actual, log = gpkg_to_final(work, "step", out_path, output_format, output_encoding, extra_args=extra_b)
     logs.append(f"[② 재투영] {log}")
     if not ok:
-        return False, out_path, counts, "\n".join(logs)
-    counts["출력"] = ogr_layer_stats(out_path).get("features")
-    return True, out_path, counts, "\n".join(logs)
+        return False, actual, counts, "\n".join(logs)
+    counts["출력"] = ogr_layer_stats(actual).get("features")
+    return True, actual, counts, "\n".join(logs)
 
 
 def get_ogr_summary(layer: LayerInfo) -> str:
@@ -495,6 +503,39 @@ def ogr_layer_stats(path: Path, input_encoding: str | None = None, sublayer: str
     return stats
 
 
+def gpkg_to_final(
+    gpkg_path: Path,
+    source_layer: str | None,
+    out_path: Path,
+    output_format: str,
+    output_encoding: str,
+    extra_args: list[str] | None = None,
+) -> tuple[bool, Path, str]:
+    """UTF-8 GPKG(중간 결과)를 최종 형식으로 저장합니다.
+
+    SHP 저장이 실패하면 자동으로 GPKG로 대체 저장해, 어떤 경우에도 결과물이 남도록 합니다.
+    실제 저장된 경로를 함께 반환합니다(대체 시 .gpkg 경로).
+    """
+    ogr2ogr, _ = gdals()
+    if not ogr2ogr:
+        return False, out_path, "ogr2ogr을 찾을 수 없습니다."
+    src_tail = [str(gpkg_path)] + ([source_layer] if source_layer else [])
+    if output_format == "GPKG":
+        args = [ogr2ogr, "-overwrite", "-f", "GPKG"] + (extra_args or []) + [str(out_path), *src_tail]
+        ok, log = run_cmd(args)
+        return ok, out_path, log
+    args = [ogr2ogr, "-overwrite", "-f", "ESRI Shapefile", "-lco", f"ENCODING={output_encoding}"] + (extra_args or []) + [str(out_path), *src_tail]
+    ok, log = run_cmd(args)
+    if ok:
+        return True, out_path, log
+    # SHP 저장 실패 -> GPKG로 대체(빈손 방지)
+    fallback = out_path.with_suffix(".gpkg")
+    fargs = [ogr2ogr, "-overwrite", "-f", "GPKG"] + (extra_args or []) + [str(fallback), *src_tail]
+    ok2, log2 = run_cmd(fargs)
+    note = "⚠️ SHP 저장에 실패해 GPKG로 대체했습니다(QGIS에서 동일하게 열립니다)."
+    return ok2, (fallback if ok2 else out_path), (log + "\n" + log2 + "\n" + note).strip()
+
+
 def sqlite_sql_to_output(
     src_path: Path,
     sql: str,
@@ -503,24 +544,17 @@ def sqlite_sql_to_output(
     output_encoding: str,
     oo_encoding: str | None = None,
     extra_args: list[str] | None = None,
-) -> tuple[bool, str]:
-    """SQLite dialect(공간함수 ST_*) 결과를 인코딩 안전하게 저장합니다.
+) -> tuple[bool, Path, str]:
+    """SQLite dialect(공간함수 ST_*) 결과를 인코딩 안전하게 저장하고 실제 경로를 반환합니다.
 
     SQLite dialect로 SHP를 직접 쓰면 일부 GDAL 버전(예: 클라우드 apt gdal-bin)에서
     `-lco ENCODING`이 무시돼 한글이 ISO-8859-1로 손상(???)됩니다. 그래서 공간 SQL 결과는
-    먼저 UTF-8이 보장되는 GPKG로 만들고, SHP은 그 GPKG를 일반 변환으로 다시 저장합니다.
+    먼저 UTF-8이 보장되는 GPKG로 만들고, 최종 형식으로 다시 저장합니다.
+    SHP 저장 실패 시 GPKG로 자동 대체합니다.
     """
     ogr2ogr, _ = gdals()
     if not ogr2ogr:
-        return False, "ogr2ogr을 찾을 수 없습니다."
-    if output_format == "GPKG":
-        args = [ogr2ogr, "-overwrite", "-f", "GPKG", "-dialect", "SQLite", "-sql", sql]
-        if oo_encoding:
-            args += ["-oo", f"ENCODING={oo_encoding}"]
-        if extra_args:
-            args += extra_args
-        args += [str(out_path), str(src_path)]
-        return run_cmd(args)
+        return False, out_path, "ogr2ogr을 찾을 수 없습니다."
     tmp = out_path.parent / f"_sqltmp_{safe_name(out_path.stem)}.gpkg"
     if tmp.exists():
         tmp.unlink()
@@ -532,10 +566,9 @@ def sqlite_sql_to_output(
     a1 += [str(tmp), str(src_path)]
     ok, l1 = run_cmd(a1)
     if not ok:
-        return False, l1
-    a2 = [ogr2ogr, "-overwrite", "-f", "ESRI Shapefile", "-lco", f"ENCODING={output_encoding}", str(out_path), str(tmp), "result"]
-    ok, l2 = run_cmd(a2)
-    return ok, (l1 + "\n" + l2).strip()
+        return False, out_path, l1
+    ok2, actual, l2 = gpkg_to_final(tmp, "result", out_path, output_format, output_encoding)
+    return ok2, actual, (l1 + "\n" + l2).strip()
 
 
 def add_area_column(
@@ -554,11 +587,11 @@ def add_area_column(
     dec = max(int(decimals), 0)
     sql = f"SELECT *, ROUND(ST_Area(geometry), {dec}) AS {quote_ident(field)} FROM {quote_ident(layer_name)}"
     out_path = src_path.with_name(f"{src_path.stem}_area{src_path.suffix}")
-    ok, log = sqlite_sql_to_output(
+    ok, actual, log = sqlite_sql_to_output(
         src_path, sql, out_path, output_format, output_encoding,
         oo_encoding=(output_encoding if src_path.suffix.lower() == ".shp" else None),
     )
-    return ok, (out_path if ok else src_path), log
+    return ok, (actual if ok else src_path), log
 
 
 def shp_sidecars(shp_path: Path) -> list[Path]:
@@ -569,6 +602,16 @@ def shp_sidecars(shp_path: Path) -> list[Path]:
 def shapefile_to_zip_download(path: Path) -> bytes:
     files = shp_sidecars(path) if path.suffix.lower() == ".shp" else [path]
     return zip_paths(files, f"{path.stem}.zip")
+
+
+def download_for_path(path: Path) -> tuple[str, bytes]:
+    """실제 결과 파일 형식에 맞는 (파일명, 바이트)를 돌려줍니다.
+
+    SHP은 sidecar까지 zip으로, GPKG(대체 포함)은 단일 파일로 제공합니다.
+    """
+    if path.suffix.lower() == ".shp":
+        return f"{path.stem}.zip", shapefile_to_zip_download(path)
+    return path.name, path.read_bytes()
 
 
 def unique_values_from_dbf(layer: LayerInfo, column: str, encoding: str, limit: int = 5000) -> list[str]:
@@ -613,7 +656,7 @@ def dissolve_one_layer(
     agg_map: dict[str, str] | None = None,
     makevalid: bool = False,
     output_encoding: str = "UTF-8",
-) -> tuple[bool, str]:
+) -> tuple[bool, Path, str]:
     layer_name = layer.path.stem
     select_parts = [quote_ident(column), "ST_Union(geometry) AS geometry"]
     for col, func in (agg_map or {}).items():
@@ -644,10 +687,10 @@ def merge_layers(
     input_encoding: str,
     output_encoding: str,
     makevalid: bool = False,
-) -> tuple[bool, str]:
+) -> tuple[bool, Path, str]:
     ogr2ogr, _ = gdals()
     if not ogr2ogr:
-        return False, "ogr2ogr을 찾을 수 없습니다."
+        return False, out_path, "ogr2ogr을 찾을 수 없습니다."
     temp_gpkg = out_path if output_format == "GPKG" else out_path.with_suffix(".gpkg")
     if temp_gpkg.exists():
         temp_gpkg.unlink()
@@ -668,24 +711,14 @@ def merge_layers(
         ok, output = run_cmd(args)
         logs.append(f"[{layer.name}] {output}")
         if not ok:
-            return False, "\n".join(logs)
+            return False, out_path, "\n".join(logs)
 
     if output_format == "SHP":
-        ok, output = run_cmd(
-            [
-                ogr2ogr,
-                "-overwrite",
-                "-f",
-                "ESRI Shapefile",
-                "-lco",
-                f"ENCODING={output_encoding}",
-                str(out_path),
-                str(temp_gpkg),
-            ]
-        )
+        # temp_gpkg(UTF-8) -> SHP, 실패 시 GPKG로 자동 대체
+        ok, actual, output = gpkg_to_final(temp_gpkg, "merged", out_path, "SHP", output_encoding)
         logs.append(output)
-        return ok, "\n".join(logs)
-    return True, "\n".join(logs)
+        return ok, actual, "\n".join(logs)
+    return True, temp_gpkg, "\n".join(logs)
 
 
 def split_layer_by_values(
@@ -788,11 +821,11 @@ def join_code_table(
     output_format: str,
     input_encoding: str,
     output_encoding: str,
-) -> tuple[bool, str]:
+) -> tuple[bool, Path, str]:
     """SHP 속성에 substr(mnum, start, length) 키로 코드표를 LEFT JOIN한 새 레이어를 만듭니다."""
     ogr2ogr, _ = gdals()
     if not ogr2ogr:
-        return False, "ogr2ogr을 찾을 수 없습니다."
+        return False, out_path, "ogr2ogr을 찾을 수 없습니다."
     work = out_path.parent / "_codejoin_work.gpkg"
     if work.exists():
         work.unlink()
@@ -806,14 +839,14 @@ def join_code_table(
     ok, log = run_cmd(a1)
     logs.append(f"[src] {log}")
     if not ok:
-        return False, "\n".join(logs)
+        return False, out_path, "\n".join(logs)
 
     # 2) 정규화된 UTF-8 코드표 CSV -> GPKG 레이어 'codes' (모두 문자열)
     a2 = [ogr2ogr, "-update", "-f", "GPKG", "-nln", "codes", "-oo", "AUTODETECT_TYPE=NO", str(work), str(code_csv_path)]
     ok, log = run_cmd(a2)
     logs.append(f"[codes] {log}")
     if not ok:
-        return False, "\n".join(logs)
+        return False, out_path, "\n".join(logs)
 
     # 3) LEFT JOIN
     select_parts = ["s.*"] + [f"c.{quote_ident(col)} AS {quote_ident(col)}" for col in value_cols]
@@ -823,9 +856,9 @@ def join_code_table(
         f"ON TRIM(substr(s.{quote_ident(mnum_col)}, {int(start)}, {int(length)})) = TRIM(c.{quote_ident(code_key_col)})"
     )
     # work.gpkg는 이미 UTF-8이므로 oo_encoding 불필요. SHP은 GPKG 경유로 인코딩 안전 저장.
-    ok, log = sqlite_sql_to_output(work, sql, out_path, output_format, output_encoding)
+    ok, actual, log = sqlite_sql_to_output(work, sql, out_path, output_format, output_encoding)
     logs.append(f"[join] {log}")
-    return ok, "\n".join(logs)
+    return ok, actual, "\n".join(logs)
 
 
 def render_layer_status(layers: list[LayerInfo], encoding: str) -> None:
@@ -914,7 +947,7 @@ def render_convert_tab(layers: list[LayerInfo], encoding: str, output_encoding: 
                 )
                 repaired_n = counts.get("복구후")
             else:
-                ok, log = convert_layer(layer, out_path, target_epsg, source_override or None, output_format, encoding, output_encoding, makevalid)
+                ok, out_path, log = convert_layer(layer, out_path, target_epsg, source_override or None, output_format, encoding, output_encoding, makevalid)
                 repaired_n = None
             logs.append(f"## {layer.name}\n{log}")
             if ok:
@@ -942,6 +975,8 @@ def render_convert_tab(layers: list[LayerInfo], encoding: str, output_encoding: 
         if results:
             st.success(f"{len(results)}개 레이어 변환 완료")
             st.download_button("결과 전체 다운로드(zip)", zip_paths(results, "converted.zip"), "converted.zip")
+            if output_format == "SHP" and any(p.suffix.lower() == ".gpkg" for p in results):
+                st.warning("일부 레이어는 SHP 저장에 실패해 GPKG로 대체 저장했습니다(zip 안에 .gpkg로 들어있고, QGIS에서 동일하게 열립니다).")
             if dropped_any:
                 st.error(
                     "⚠️ 변환 중 사라진 피처가 있습니다(손실 열 확인). 원인은 보통 (1) 원본 좌표계 오판 또는 (2) 불량 도형입니다. "
@@ -1010,14 +1045,15 @@ def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
                 shutil.rmtree(out_dir)
             out_dir.mkdir(parents=True)
             out_path = output_dataset_path(out_dir, f"{layer.name}_dissolved_by_{column}", output_format)
-            ok, log = dissolve_one_layer(layer, column, out_path, output_format, encoding, target_epsg or None, agg_map, makevalid, output_encoding)
+            ok, out_path, log = dissolve_one_layer(layer, column, out_path, output_format, encoding, target_epsg or None, agg_map, makevalid, output_encoding)
             if ok and add_area:
                 area_ok, out_path, area_log = add_area_column(out_path, output_format, output_encoding, int(area_decimals))
                 log = f"{log}\n[면적] {'area_m2 추가 완료' if area_ok else area_log}"
             if ok:
                 st.success("병합 완료")
-                filename = f"{out_path.stem}.zip" if output_format == "SHP" else out_path.name
-                data = shapefile_to_zip_download(out_path) if output_format == "SHP" else out_path.read_bytes()
+                if out_path.suffix.lower() == ".gpkg" and output_format == "SHP":
+                    st.warning("SHP 저장에 실패해 GPKG로 대체 저장했습니다(QGIS에서 동일하게 열립니다).")
+                filename, data = download_for_path(out_path)
                 st.download_button("결과 다운로드", data, filename)
             else:
                 st.error("병합 실패")
@@ -1034,11 +1070,12 @@ def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
                 shutil.rmtree(out_dir)
             out_dir.mkdir(parents=True)
             out_path = output_dataset_path(out_dir, "merged_layers", output_format)
-            ok, log = merge_layers(chosen, out_path, output_format, target_epsg or None, encoding, output_encoding, makevalid)
+            ok, out_path, log = merge_layers(chosen, out_path, output_format, target_epsg or None, encoding, output_encoding, makevalid)
             if ok:
                 st.success("병합 완료")
-                filename = f"{out_path.stem}.zip" if output_format == "SHP" else out_path.name
-                data = shapefile_to_zip_download(out_path) if output_format == "SHP" else out_path.read_bytes()
+                if out_path.suffix.lower() == ".gpkg" and output_format == "SHP":
+                    st.warning("SHP 저장에 실패해 GPKG로 대체 저장했습니다(QGIS에서 동일하게 열립니다).")
+                filename, data = download_for_path(out_path)
                 st.download_button("결과 다운로드", data, filename)
                 total = sum(int(ogr_layer_stats(item.path, encoding, item.sublayer).get("features", 0) or 0) for item in chosen)
                 merged_n = ogr_layer_stats(out_path).get("features")
@@ -1242,17 +1279,18 @@ def render_join_tab(layers: list[LayerInfo], encoding: str, output_encoding: str
         code_csv = out_dir / "codes_utf8.csv"
         code_df.to_csv(code_csv, index=False, encoding="utf-8")
         out_path = output_dataset_path(out_dir, f"{layer.name}_joined", output_format)
-        ok, log = join_code_table(
+        ok, out_path, log = join_code_table(
             layer, mnum_col, int(start), int(length), code_csv, join_key_col, value_cols,
             out_path, output_format, encoding, output_encoding,
         )
         if ok:
             st.success("코드 결합 완료")
-            filename = f"{out_path.stem}.zip" if output_format == "SHP" else out_path.name
-            data = shapefile_to_zip_download(out_path) if output_format == "SHP" else out_path.read_bytes()
+            if out_path.suffix.lower() == ".gpkg" and output_format == "SHP":
+                st.warning("SHP 저장에 실패해 GPKG로 대체 저장했습니다(QGIS에서 동일하게 열립니다).")
+            filename, data = download_for_path(out_path)
             st.download_button("결과 다운로드", data, filename)
             try:
-                joined_preview = read_dbf_preview(out_path.with_suffix(".dbf"), output_encoding, limit=20) if output_format == "SHP" else None
+                joined_preview = read_dbf_preview(out_path.with_suffix(".dbf"), output_encoding, limit=20) if out_path.suffix.lower() == ".shp" else None
                 if joined_preview is not None:
                     st.caption("결합 결과 미리보기")
                     st.dataframe(joined_preview, width="stretch", hide_index=True)
