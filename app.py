@@ -495,10 +495,54 @@ def ogr_layer_stats(path: Path, input_encoding: str | None = None, sublayer: str
     return stats
 
 
+def sqlite_sql_to_output(
+    src_path: Path,
+    sql: str,
+    out_path: Path,
+    output_format: str,
+    output_encoding: str,
+    oo_encoding: str | None = None,
+    extra_args: list[str] | None = None,
+) -> tuple[bool, str]:
+    """SQLite dialect(공간함수 ST_*) 결과를 인코딩 안전하게 저장합니다.
+
+    SQLite dialect로 SHP를 직접 쓰면 일부 GDAL 버전(예: 클라우드 apt gdal-bin)에서
+    `-lco ENCODING`이 무시돼 한글이 ISO-8859-1로 손상(???)됩니다. 그래서 공간 SQL 결과는
+    먼저 UTF-8이 보장되는 GPKG로 만들고, SHP은 그 GPKG를 일반 변환으로 다시 저장합니다.
+    """
+    ogr2ogr, _ = gdals()
+    if not ogr2ogr:
+        return False, "ogr2ogr을 찾을 수 없습니다."
+    if output_format == "GPKG":
+        args = [ogr2ogr, "-overwrite", "-f", "GPKG", "-dialect", "SQLite", "-sql", sql]
+        if oo_encoding:
+            args += ["-oo", f"ENCODING={oo_encoding}"]
+        if extra_args:
+            args += extra_args
+        args += [str(out_path), str(src_path)]
+        return run_cmd(args)
+    tmp = out_path.parent / f"_sqltmp_{safe_name(out_path.stem)}.gpkg"
+    if tmp.exists():
+        tmp.unlink()
+    a1 = [ogr2ogr, "-overwrite", "-f", "GPKG", "-dialect", "SQLite", "-sql", sql, "-nln", "result"]
+    if oo_encoding:
+        a1 += ["-oo", f"ENCODING={oo_encoding}"]
+    if extra_args:
+        a1 += extra_args
+    a1 += [str(tmp), str(src_path)]
+    ok, l1 = run_cmd(a1)
+    if not ok:
+        return False, l1
+    a2 = [ogr2ogr, "-overwrite", "-f", "ESRI Shapefile", "-lco", f"ENCODING={output_encoding}", str(out_path), str(tmp), "result"]
+    ok, l2 = run_cmd(a2)
+    return ok, (l1 + "\n" + l2).strip()
+
+
 def add_area_column(
     src_path: Path,
     output_format: str,
     output_encoding: str,
+    decimals: int = 1,
     field: str = "area_m2",
 ) -> tuple[bool, Path, str]:
     """결과 레이어에 ST_Area 기반 면적(㎡) 컬럼을 추가한 새 파일을 만듭니다.
@@ -506,17 +550,14 @@ def add_area_column(
     좌표계가 미터 기반 투영좌표계(EPSG:5186 등)일 때만 ㎡가 정확합니다.
     src_path는 이 앱이 생성한 결과물이라 레이어명이 파일명과 같다고 가정합니다.
     """
-    ogr2ogr, _ = gdals()
-    if not ogr2ogr:
-        return False, src_path, "ogr2ogr을 찾을 수 없습니다."
     layer_name = src_path.stem
+    dec = max(int(decimals), 0)
+    sql = f"SELECT *, ROUND(ST_Area(geometry), {dec}) AS {quote_ident(field)} FROM {quote_ident(layer_name)}"
     out_path = src_path.with_name(f"{src_path.stem}_area{src_path.suffix}")
-    sql = f"SELECT *, ROUND(ST_Area(geometry), 1) AS {quote_ident(field)} FROM {quote_ident(layer_name)}"
-    args = [ogr2ogr, "-overwrite", "-f", ogr_output_format(output_format), "-dialect", "SQLite", "-sql", sql]
-    if output_format == "SHP":
-        args += ["-lco", f"ENCODING={output_encoding}"]
-    args += [str(out_path), str(src_path)]
-    ok, log = run_cmd(args)
+    ok, log = sqlite_sql_to_output(
+        src_path, sql, out_path, output_format, output_encoding,
+        oo_encoding=(output_encoding if src_path.suffix.lower() == ".shp" else None),
+    )
     return ok, (out_path if ok else src_path), log
 
 
@@ -571,10 +612,8 @@ def dissolve_one_layer(
     target_epsg: str | None,
     agg_map: dict[str, str] | None = None,
     makevalid: bool = False,
+    output_encoding: str = "UTF-8",
 ) -> tuple[bool, str]:
-    ogr2ogr, _ = gdals()
-    if not ogr2ogr:
-        return False, "ogr2ogr을 찾을 수 없습니다."
     layer_name = layer.path.stem
     select_parts = [quote_ident(column), "ST_Union(geometry) AS geometry"]
     for col, func in (agg_map or {}).items():
@@ -585,26 +624,16 @@ def dissolve_one_layer(
         f"SELECT {', '.join(select_parts)} "
         f"FROM {quote_ident(layer_name)} GROUP BY {quote_ident(column)}"
     )
-    args = [
-        ogr2ogr,
-        "-overwrite",
-        "-f",
-        ogr_output_format(output_format),
-        "-dialect",
-        "SQLite",
-        "-sql",
-        sql,
-        "-nlt",
-        "PROMOTE_TO_MULTI",
-    ]
-    if input_encoding:
-        args += ["-oo", f"ENCODING={input_encoding}"]
+    extra: list[str] = ["-nlt", "PROMOTE_TO_MULTI"]
     if target_epsg:
-        args += ["-t_srs", f"EPSG:{target_epsg}"]
+        extra += ["-t_srs", f"EPSG:{target_epsg}"]
     if makevalid:
-        args += ["-makevalid"]
-    args += [str(out_path), str(layer.path)]
-    return run_cmd(args)
+        extra += ["-makevalid"]
+    return sqlite_sql_to_output(
+        layer.path, sql, out_path, output_format, output_encoding,
+        oo_encoding=(input_encoding if layer.kind == "SHP" else None),
+        extra_args=extra,
+    )
 
 
 def merge_layers(
@@ -793,11 +822,8 @@ def join_code_table(
         f"LEFT JOIN codes c "
         f"ON TRIM(substr(s.{quote_ident(mnum_col)}, {int(start)}, {int(length)})) = TRIM(c.{quote_ident(code_key_col)})"
     )
-    a3 = [ogr2ogr, "-overwrite", "-f", ogr_output_format(output_format), "-dialect", "SQLite", "-sql", sql]
-    if output_format == "SHP":
-        a3 += ["-lco", f"ENCODING={output_encoding}"]
-    a3 += [str(out_path), str(work)]
-    ok, log = run_cmd(a3)
+    # work.gpkg는 이미 UTF-8이므로 oo_encoding 불필요. SHP은 GPKG 경유로 인코딩 안전 저장.
+    ok, log = sqlite_sql_to_output(work, sql, out_path, output_format, output_encoding)
     logs.append(f"[join] {log}")
     return ok, "\n".join(logs)
 
@@ -863,6 +889,7 @@ def render_convert_tab(layers: list[LayerInfo], encoding: str, output_encoding: 
         help="일반 변환 시 도형 보정. 안전 변환 모드에서는 항상 적용되므로 비활성화됩니다.",
     )
     add_area = st.checkbox("면적 컬럼(area_m2, ㎡) 추가", value=False, help="변환된 결과에 폴리곤 면적을 ㎡로 계산해 넣습니다. 미터 단위 투영좌표계에서만 정확합니다.")
+    area_decimals = st.number_input("면적 소수점 자리수", min_value=0, max_value=6, value=1, step=1, key="convert_area_dec", disabled=not add_area) if add_area else 1
     if add_area and target_epsg == "4326":
         st.warning("EPSG:4326(경위도)는 면적이 ㎡가 아니라 제곱도로 계산됩니다. 5186 등 미터 좌표계를 목표로 선택하세요.")
     if safe_mode and not source_override:
@@ -892,7 +919,7 @@ def render_convert_tab(layers: list[LayerInfo], encoding: str, output_encoding: 
             logs.append(f"## {layer.name}\n{log}")
             if ok:
                 if add_area:
-                    area_ok, out_path, area_log = add_area_column(out_path, output_format, output_encoding)
+                    area_ok, out_path, area_log = add_area_column(out_path, output_format, output_encoding, int(area_decimals))
                     logs.append(f"[면적] {area_log}" if not area_ok else "[면적] area_m2 추가 완료")
                 results.append(out_path)
                 after = ogr_layer_stats(out_path)
@@ -951,6 +978,7 @@ def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
         column = st.selectbox("묶을 기준 컬럼", columns, key="merge_column")
         st.caption("같은 컬럼값을 가진 도형들을 하나의 멀티파트 도형으로 합칩니다.")
         add_area = st.checkbox("면적 컬럼(area_m2, ㎡) 추가", value=False, key="merge_area", help="병합된 구역별 면적을 ㎡로 계산해 넣습니다. 미터 단위 투영좌표계에서만 정확합니다.")
+        area_decimals = st.number_input("면적 소수점 자리수", min_value=0, max_value=6, value=1, step=1, key="merge_area_dec", disabled=not add_area) if add_area else 1
         if add_area and target_epsg == "4326":
             st.warning("EPSG:4326(경위도)는 면적이 ㎡가 아니라 제곱도로 계산됩니다. 5186 등 미터 좌표계로 통일하세요.")
 
@@ -982,9 +1010,9 @@ def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
                 shutil.rmtree(out_dir)
             out_dir.mkdir(parents=True)
             out_path = output_dataset_path(out_dir, f"{layer.name}_dissolved_by_{column}", output_format)
-            ok, log = dissolve_one_layer(layer, column, out_path, output_format, encoding, target_epsg or None, agg_map, makevalid)
+            ok, log = dissolve_one_layer(layer, column, out_path, output_format, encoding, target_epsg or None, agg_map, makevalid, output_encoding)
             if ok and add_area:
-                area_ok, out_path, area_log = add_area_column(out_path, output_format, output_encoding)
+                area_ok, out_path, area_log = add_area_column(out_path, output_format, output_encoding, int(area_decimals))
                 log = f"{log}\n[면적] {'area_m2 추가 완료' if area_ok else area_log}"
             if ok:
                 st.success("병합 완료")
