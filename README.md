@@ -717,6 +717,10 @@ ogrinfo: C:\Program Files\QGIS 3.30.3\bin\ogrinfo.exe
 - GPKG 내부 복수 레이어 개별 인식/선택(ogrinfo로 레이어 나열, `file:layer` 단위 처리)
 - 면적 컬럼(area_m2, ㎡) 추가 옵션(변환·병합 탭). ST_Area 기반, 투영 후 결과에 후처리로 계산해 미터 좌표계에서 정확. 경위도(4326)는 경고 표시
 - 4. 코드 결합 탭: SHP 속성의 MNUM 등에서 `substr(컬럼, 시작, 길이)`(기본 21,6)로 코드를 뽑아 용도지역 코드표 CSV를 LEFT JOIN. 코드표 CSV 업로드+인코딩 후보별 깨짐 점수 표시 및 수동 선택(UTF-8-SIG/CP949/EUC-KR/UTF-8, 권장값 자동 기본선택), 대상 SHP 인코딩 확인(사이드바 입력 인코딩 검증), MNUM 컬럼/시작·길이 지정, 추출코드·매칭률 미리보기, 결합할 컬럼 선택. 원본 DBF를 직접 편집하지 않고 결합된 새 SHP/GPKG 생성. 구현: SHP+CSV를 임시 GPKG 2레이어로 넣고 SQLite dialect join(`substr`,`TRIM`), 출력 SHP은 `-lco ENCODING`로 한글 보존
+- 공간 SQL(면적/dissolve/코드결합) 결과의 인코딩 안전 저장(`sqlite_sql_to_output`): SQLite dialect로 SHP를 직접 쓰면 일부 GDAL 버전(클라우드 apt gdal-bin)에서 `-lco ENCODING`이 무시돼 한글이 손상(???)되므로, 항상 UTF-8 GPKG로 만든 뒤 SHP로 재변환
+- 결과물 빈손 방지 안전망(`gpkg_to_final`): SHP 저장이 실패하면 자동으로 GPKG로 대체 저장하고 화면에 안내(변환·병합·면적·코드결합 공통). 모든 처리 함수가 실제 저장 경로를 반환, 다운로드는 `download_for_path`가 실제 형식에 맞춰 제공
+- 면적 소수점 자리수 선택(변환·병합 탭, 0~6자리)
+- 배포: Streamlit Community Cloud(https://gis-shp-tool.streamlit.app), GitHub uurimii16/gis-shp-tool. `packages.txt`(`gdal-bin`,`libsqlite3-mod-spatialite`)로 서버가 GDAL/spatialite 자동 설치. 절전방지 GitHub Actions(6h 방문)
 
 ## 현재 한계
 
@@ -726,6 +730,12 @@ ogrinfo: C:\Program Files\QGIS 3.30.3\bin\ogrinfo.exe
 - GPKG 내부 복수 레이어는 개별 인식/선택됩니다. 단 GPKG는 DBF가 없어 속성 미리보기·컬럼 기준 병합/분할 대상에서는 제외됩니다(SHP 전용).
 - SHP 내부 컬럼값 기준 병합은 기준 컬럼과 geometry 중심으로 결과를 만듭니다.
 - 병합 시 모든 속성 컬럼을 어떻게 집계할지는 아직 옵션화하지 않았습니다.
+
+### 🔴 알려진 이슈(미해결, 2026-07-03)
+
+- **dissolve(한 SHP 내 컬럼값 기준 병합) 결과 폴리곤 선형이 깨짐.** 텍스트(속성)는 정상인데 도형 경계선이 이상하게 나옴.
+  - 원인: **`ST_Union` 연산 자체**(결과를 GPKG로 출력해도 동일하게 깨지므로 GPKG→SHP 변환 문제 아님). 원본 폴리곤의 위상 오류(자기교차/겹침/미세 슬리버)를 복구하지 않고 union하면 GEOS가 깨진 결과를 냄. 현재 `-makevalid`는 union 다음에 적용돼 순서가 비효율적.
+  - 수정 방향(다음 작업): dissolve를 "복구 먼저 → union"으로. `ST_Union(ST_MakeValid(geometry))` 또는 2단계(원본 makevalid로 GPKG 생성 → 그 GPKG에서 `ST_Union GROUP BY`). 대상 함수 `dissolve_one_layer`, 참고 패턴 `convert_layer_safe`. 상세는 [작업로그.md](작업로그.md) "미해결/다음 작업" 참고.
 
 ## 향후 보강하면 좋은 기능
 
