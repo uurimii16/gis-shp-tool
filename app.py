@@ -571,6 +571,28 @@ def sqlite_sql_to_output(
     return ok2, actual, (l1 + "\n" + l2).strip()
 
 
+def resolve_layer_and_geom(path: Path) -> tuple[str, str]:
+    """결과 파일의 (레이어명, 지오메트리 컬럼명)을 실제로 확인해 돌려줍니다.
+
+    GPKG는 내부 레이어명이 파일명과 다를 수 있어(예: dissolve 결과는 'result')
+    ogrinfo로 실제 레이어명과 지오메트리 컬럼명을 읽습니다.
+    SHP는 레이어명=파일명, 지오메트리 컬럼은 SQLite dialect 기본 'geometry'.
+    """
+    if path.suffix.lower() != ".gpkg":
+        return path.stem, "geometry"
+    names = gpkg_layer_names(path)
+    layer = names[0] if names else path.stem
+    geom = "geometry"
+    _, ogrinfo = gdals()
+    if ogrinfo:
+        ok, out = run_cmd([ogrinfo, "-so", str(path), layer])
+        if ok:
+            m = re.search(r"Geometry Column\s*=\s*(\S+)", out)
+            if m:
+                geom = m.group(1)
+    return layer, geom
+
+
 def add_area_column(
     src_path: Path,
     output_format: str,
@@ -581,11 +603,11 @@ def add_area_column(
     """결과 레이어에 ST_Area 기반 면적(㎡) 컬럼을 추가한 새 파일을 만듭니다.
 
     좌표계가 미터 기반 투영좌표계(EPSG:5186 등)일 때만 ㎡가 정확합니다.
-    src_path는 이 앱이 생성한 결과물이라 레이어명이 파일명과 같다고 가정합니다.
+    레이어명·지오메트리 컬럼명은 파일에서 실제로 확인합니다(GPKG는 파일명과 다를 수 있음).
     """
-    layer_name = src_path.stem
+    layer_name, geom_col = resolve_layer_and_geom(src_path)
     dec = max(int(decimals), 0)
-    sql = f"SELECT *, ROUND(ST_Area(geometry), {dec}) AS {quote_ident(field)} FROM {quote_ident(layer_name)}"
+    sql = f"SELECT *, ROUND(ST_Area({quote_ident(geom_col)}), {dec}) AS {quote_ident(field)} FROM {quote_ident(layer_name)}"
     out_path = src_path.with_name(f"{src_path.stem}_area{src_path.suffix}")
     ok, actual, log = sqlite_sql_to_output(
         src_path, sql, out_path, output_format, output_encoding,
@@ -645,6 +667,21 @@ DISSOLVE_AGG_FUNCS = {
     "개수(COUNT)": "COUNT",
 }
 
+# 도형을 유지하며 그룹 집계값을 각 피처에 붙이는 모드용(텍스트 이어붙이기 포함)
+KEEP_AGG_FUNCS = {
+    "제외": None,
+    "합계(SUM)": "SUM",
+    "평균(AVG)": "AVG",
+    "최대(MAX)": "MAX",
+    "최소(MIN)": "MIN",
+    "개수(COUNT)": "COUNT",
+    "텍스트 이어붙이기": "GROUP_CONCAT",
+}
+
+# 집계 결과 컬럼명에 붙일 짧은 꼬리표(원본 컬럼은 보존, 새 컬럼으로 추가)
+AGG_SUFFIX = {"SUM": "합계", "AVG": "평균", "MAX": "최대", "MIN": "최소",
+              "COUNT": "개수", "GROUP_CONCAT": "묶음"}
+
 
 def dissolve_one_layer(
     layer: LayerInfo,
@@ -657,7 +694,35 @@ def dissolve_one_layer(
     makevalid: bool = False,
     output_encoding: str = "UTF-8",
 ) -> tuple[bool, Path, str]:
-    layer_name = layer.path.stem
+    """한 SHP 내 컬럼값 기준 병합(dissolve). 속성만 합치고 바깥 도형은 보존합니다.
+
+    도형 깨짐(경계선 스파이크) 방지를 위해 항상 2단계로 처리합니다.
+      ① 원본 도형을 -makevalid로 복구해 UTF-8 GPKG 생성 (재투영 없이 네이티브 좌표).
+      ② 복구된 GPKG에서 ST_Union ... GROUP BY 로 병합 (+ 필요 시 재투영, 최종 -makevalid).
+    위상 오류(자기교차/겹침/미세 슬리버)를 복구한 뒤 union하므로 GEOS가 깨진 경계선을
+    만들지 않습니다. union은 인접 폴리곤의 '공유 내부 경계'만 지우고 바깥 윤곽선은
+    그대로 유지하므로, 속성만 합쳐지고 도형 모양은 바뀌지 않습니다.
+    (복구는 항상 수행합니다. 이것이 도형 깨짐의 근본 해결이므로 makevalid 체크와 무관.)
+    """
+    ogr2ogr, _ = gdals()
+    if not ogr2ogr:
+        return False, out_path, "ogr2ogr을 찾을 수 없습니다."
+
+    # ── ① 도형 복구 먼저 (재투영 없이 네이티브 좌표에서) → UTF-8 GPKG
+    repaired = out_path.parent / f"_dissolve_src_{safe_name(layer.name)}.gpkg"
+    if repaired.exists():
+        repaired.unlink()
+    # GPKG 지오메트리 컬럼 기본명은 'geom' → 다음 union SQL에서 참조할 수 있게 'geometry'로 고정
+    a1 = [ogr2ogr, "-overwrite", "-f", "GPKG", "-nln", "src",
+          "-lco", "GEOMETRY_NAME=geometry", "-makevalid", "-nlt", "PROMOTE_TO_MULTI"]
+    if layer.kind == "SHP" and input_encoding:
+        a1 += ["-oo", f"ENCODING={input_encoding}"]
+    a1 += [str(repaired), *ogr_source_args(layer)]
+    ok, log1 = run_cmd(a1)
+    if not ok:
+        return False, out_path, f"[① 도형복구 실패] {log1}"
+
+    # ── ② 복구된 GPKG에서 union (레이어명은 위에서 -nln 으로 'src' 로 지정)
     select_parts = [quote_ident(column), "ST_Union(geometry) AS geometry"]
     for col, func in (agg_map or {}).items():
         if col == column or not func:
@@ -665,18 +730,111 @@ def dissolve_one_layer(
         select_parts.append(f"{func}({quote_ident(col)}) AS {quote_ident(col)}")
     sql = (
         f"SELECT {', '.join(select_parts)} "
-        f"FROM {quote_ident(layer_name)} GROUP BY {quote_ident(column)}"
+        f"FROM {quote_ident('src')} GROUP BY {quote_ident(column)}"
     )
-    extra: list[str] = ["-nlt", "PROMOTE_TO_MULTI"]
+    # union 결과에 남을 수 있는 미세 오류를 최종 정리(-makevalid는 항상). 재투영은 선택.
+    extra: list[str] = ["-nlt", "PROMOTE_TO_MULTI", "-makevalid"]
     if target_epsg:
         extra += ["-t_srs", f"EPSG:{target_epsg}"]
-    if makevalid:
-        extra += ["-makevalid"]
-    return sqlite_sql_to_output(
-        layer.path, sql, out_path, output_format, output_encoding,
-        oo_encoding=(input_encoding if layer.kind == "SHP" else None),
+    ok2, actual, log2 = sqlite_sql_to_output(
+        repaired, sql, out_path, output_format, output_encoding,
+        oo_encoding=None,  # 복구본은 이미 UTF-8 GPKG
         extra_args=extra,
     )
+    return ok2, actual, f"[① 도형복구] {log1}\n[② 병합] {log2}".strip()
+
+
+def aggregate_keep_geometry(
+    layer: LayerInfo,
+    column: str,
+    out_path: Path,
+    output_format: str,
+    input_encoding: str,
+    target_epsg: str | None,
+    agg_map: dict[str, str],
+    add_area: bool = False,
+    area_decimals: int = 1,
+    output_encoding: str = "UTF-8",
+) -> tuple[bool, Path, str, list[str]]:
+    """도형은 그대로 두고, 기준 컬럼(그룹)별 값을 각 피처에 새 컬럼으로 붙입니다.
+
+    dissolve(도형 합침)가 아니라 '그룹 값 되붙이기'입니다. **폴리곤 개수·모양·경계선은
+    전혀 바뀌지 않습니다.** 원본 컬럼도 그대로 남고 새 컬럼만 추가됩니다.
+    - agg_map: 지정 컬럼을 그룹별 SUM/AVG/... 로 요약해 각 피처에 부착.
+    - add_area: 각 폴리곤 면적(area_m2)과 **그룹별 면적 합계(area_m2_합계)** 를 부착.
+      면적은 목표 좌표계(target_epsg)에서 계산되도록 ①단계에서 재투영합니다.
+      (면적 열이 원본에 없어도 됩니다 — 도형에서 계산합니다.)
+
+    구현: 원본을 UTF-8 GPKG(src, geometry 컬럼명 고정)로 옮긴 뒤, 그룹 집계 서브쿼리와
+    기준 컬럼으로 LEFT JOIN(그룹키 유일 → 각 피처 1건 매칭 → 개수·fid 안전).
+    반환: (성공, 실제경로, 로그, 추가된_컬럼명_목록)
+    """
+    ogr2ogr, _ = gdals()
+    if not ogr2ogr:
+        return False, out_path, "ogr2ogr을 찾을 수 없습니다.", []
+    picked = {c: f for c, f in (agg_map or {}).items() if f and c != column}
+    if not picked and not add_area:
+        return False, out_path, "합칠 속성을 1개 이상 고르거나, '면적 계산'을 켜세요.", []
+
+    # ① 원본 → UTF-8 GPKG(src). 면적 정확도 위해 여기서 재투영. geometry 컬럼명 고정.
+    #    -makevalid: 그룹 면적을 ST_Union(겹침 1번만)으로 정확히 구하려면 union 전에 도형 복구가
+    #    필요. 유효한 도형은 그대로, 불량 도형만 보정(폴리곤 개수는 그대로 유지). CLI -makevalid는
+    #    클라우드 gdal-bin에서도 동작(ST_MakeValid SQL 함수 의존 회피).
+    work = out_path.parent / f"_agg_src_{safe_name(layer.name)}.gpkg"
+    if work.exists():
+        work.unlink()
+    a1 = [ogr2ogr, "-overwrite", "-f", "GPKG", "-nln", "src", "-lco", "GEOMETRY_NAME=geometry", "-makevalid"]
+    if layer.kind == "SHP" and input_encoding:
+        a1 += ["-oo", f"ENCODING={input_encoding}"]
+    if target_epsg:
+        a1 += ["-t_srs", f"EPSG:{target_epsg}"]
+    a1 += [str(work), *ogr_source_args(layer)]
+    ok, log1 = run_cmd(a1)
+    if not ok:
+        return False, out_path, f"[① 원본읽기 실패] {log1}", []
+
+    existing = set(columns_for_layer(layer, input_encoding))
+    used: list[str] = []          # 새로 만든 모든 컬럼명(중복 방지용)
+
+    def uniq(base: str) -> str:
+        name, i = base, 2
+        while name in existing or name in used:
+            name, i = f"{base}{i}", i + 1
+        used.append(name)
+        return name
+
+    dec = max(int(area_decimals), 0)
+    main_selects: list[str] = []   # s(각 피처)에서 바로 계산하는 컬럼 (per-feature 면적)
+    group_selects: list[str] = []  # 서브쿼리(그룹 집계) 컬럼
+    group_out: list[str] = []      # 그룹 결과에서 가져올 컬럼명
+
+    if add_area:
+        # 컬럼명은 ASCII로(SHP 10바이트 필드명 제한에서 한글이 잘려 값이 깨지는 것 방지)
+        a_each = uniq("area_m2")     # 각 폴리곤 면적(그 자체 면적, 항상 정확)
+        main_selects.append(f"ROUND(ST_Area(s.geometry), {dec}) AS {quote_ident(a_each)}")
+        # 그룹 면적은 ST_Union으로 '실제 합쳐진 면적'을 구함 → 폴리곤이 겹쳐도 겹친 부분을
+        # 한 번만 계산(단순 SUM은 겹침을 중복 계산해 과대평가됨).
+        a_sum = uniq("area_sum")
+        group_selects.append(f"ROUND(ST_Area(ST_Union(geometry)), {dec}) AS {quote_ident(a_sum)}")
+        group_out.append(a_sum)
+
+    for col, func in picked.items():
+        name = uniq(f"{col}_{AGG_SUFFIX.get(func, func)}")
+        expr = f"GROUP_CONCAT({quote_ident(col)})" if func == "GROUP_CONCAT" else f"{func}({quote_ident(col)})"
+        group_selects.append(f"{expr} AS {quote_ident(name)}")
+        group_out.append(name)
+
+    sub = (f"SELECT {quote_ident(column)} AS _k, {', '.join(group_selects)} "
+           f"FROM src GROUP BY {quote_ident(column)}")
+    parts = ["s.*"] + main_selects + [f"g.{quote_ident(n)} AS {quote_ident(n)}" for n in group_out]
+    sql = (f"SELECT {', '.join(parts)} FROM src s "
+           f"LEFT JOIN ({sub}) g ON s.{quote_ident(column)} = g._k")
+
+    # 재투영은 ①에서 끝냈으므로 ②에서는 좌표계 변경 없음
+    ok2, actual, log2 = sqlite_sql_to_output(
+        work, sql, out_path, output_format, output_encoding, oo_encoding=None,
+    )
+    return ok2, actual, f"[① 원본읽기/재투영] {log1}\n[② 값 되붙이기] {log2}".strip(), used
 
 
 def merge_layers(
@@ -997,13 +1155,16 @@ def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
     st.subheader("레이어 병합")
     if not layers:
         st.stop()
-    mode = st.radio("병합 방식", ["한 SHP 내 컬럼값 기준 병합", "여러 레이어 병합"], horizontal=True)
+    mode = st.radio(
+        "병합 방식",
+        ["한 SHP 내 컬럼값 기준 병합(도형도 합침)", "속성만 합치기(도형·개수 유지)", "여러 레이어 병합"],
+        horizontal=True)
     target_epsg = st.text_input("병합 전 목표 EPSG 통일(선택)", value="").strip()
     output_format = st.radio("결과 저장 형식", ["SHP", "GPKG"], horizontal=True, key="merge_format")
     makevalid = st.checkbox("도형 유효화(-makevalid) 적용", value=False, key="merge_makevalid", help="병합 시 잘못된 도형을 자동 보정합니다.")
     out_dir = session_root() / "merged"
 
-    if mode == "한 SHP 내 컬럼값 기준 병합":
+    if mode == "한 SHP 내 컬럼값 기준 병합(도형도 합침)":
         shp_layers = [layer for layer in layers if layer.kind == "SHP" and layer.has_dbf]
         if not shp_layers:
             st.warning("DBF가 있는 SHP 레이어가 필요합니다.")
@@ -1011,7 +1172,9 @@ def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
         layer = st.selectbox("대상 SHP", shp_layers, format_func=lambda item: item.name, key="merge_one_layer")
         columns = columns_for_layer(layer, encoding)
         column = st.selectbox("묶을 기준 컬럼", columns, key="merge_column")
-        st.caption("같은 컬럼값을 가진 도형들을 하나의 멀티파트 도형으로 합칩니다.")
+        st.caption("같은 컬럼값을 가진 도형들을 하나의 멀티파트 도형으로 합칩니다. "
+                   "바깥 윤곽선은 그대로 두고 인접 도형의 '공유 내부 경계'만 지웁니다. "
+                   "경계선 깨짐 방지를 위해 병합 전 도형 복구를 자동으로 수행합니다(위 체크와 무관).")
         add_area = st.checkbox("면적 컬럼(area_m2, ㎡) 추가", value=False, key="merge_area", help="병합된 구역별 면적을 ㎡로 계산해 넣습니다. 미터 단위 투영좌표계에서만 정확합니다.")
         area_decimals = st.number_input("면적 소수점 자리수", min_value=0, max_value=6, value=1, step=1, key="merge_area_dec", disabled=not add_area) if add_area else 1
         if add_area and target_epsg == "4326":
@@ -1059,6 +1222,80 @@ def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
                 st.error("병합 실패")
             st.code(log or "로그 없음")
             st.download_button("작업 로그 다운로드", log or "로그 없음", "merge_dissolve_log.txt", key="merge_one_log_dl")
+
+    elif mode == "속성만 합치기(도형·개수 유지)":
+        shp_layers = [layer for layer in layers if layer.kind == "SHP" and layer.has_dbf]
+        if not shp_layers:
+            st.warning("DBF가 있는 SHP 레이어가 필요합니다.")
+            return
+        layer = st.selectbox("대상 SHP", shp_layers, format_func=lambda item: item.name, key="agg_one_layer")
+        columns = columns_for_layer(layer, encoding)
+        column = st.selectbox("그룹 기준 컬럼(같은 값끼리 묶음)", columns, key="agg_column")
+        st.caption("**도형은 하나도 안 바뀝니다.** 폴리곤 개수·모양·경계선 그대로 두고, "
+                   "같은 기준값(예: NM=자연녹지지역)끼리 묶어 **면적 합계나 속성 집계값을 "
+                   "각 폴리곤에 새 컬럼으로 붙입니다.**")
+
+        agg_add_area = st.checkbox(
+            "면적(area_m2) 계산 + 그룹별 실면적 합계 추가", value=True, key="agg_add_area",
+            help="각 폴리곤 면적(area_m2)과, 같은 기준값 그룹의 실제 합친 면적(area_sum)을 붙입니다. "
+                 "area_sum은 도형을 union으로 합쳐 계산하므로 폴리곤이 겹쳐도 겹친 부분을 한 번만 셉니다(정확). "
+                 "원본에 면적 열이 없어도 도형에서 계산합니다. (합칠 속성을 안 골라도 이것만으로 실행 가능)")
+        agg_area_dec = st.number_input("면적 소수점 자리수", 0, 6, 1, 1, key="agg_area_dec", disabled=not agg_add_area) if agg_add_area else 1
+        if agg_add_area and target_epsg != "5186":
+            st.caption("💡 면적을 정확한 ㎡로 얻으려면 위 **‘병합 전 목표 EPSG 통일’에 `5186`**(미터 좌표계)을 넣으세요. "
+                       + ("현재 4326(경위도)은 ㎡가 아니라 제곱도로 나옵니다." if target_epsg == "4326" else ""))
+
+        other_columns = [col for col in columns if col != column]
+        agg_map: dict[str, str] = {}
+        if other_columns:
+            st.markdown("**합칠 속성 고르기(선택)** — 면적 외에 다른 속성도 합치고 싶을 때만. 컬럼의 ‘집계 방식’을 `제외`에서 바꾸세요. (기준 컬럼은 목록에 안 나오는 게 정상)")
+            agg_df = pd.DataFrame({"컬럼": other_columns, "집계 방식": ["제외"] * len(other_columns)})
+            edited = st.data_editor(
+                agg_df, hide_index=True, width="stretch", disabled=["컬럼"],
+                column_config={"집계 방식": st.column_config.SelectboxColumn(
+                    "집계 방식", options=list(KEEP_AGG_FUNCS.keys()), required=True)},
+                key="agg_keep_editor")
+            for _, row in edited.iterrows():
+                func = KEEP_AGG_FUNCS.get(str(row["집계 방식"]))
+                if func:
+                    agg_map[str(row["컬럼"])] = func
+            if agg_map:
+                st.success("선택됨 → " + ", ".join(f"{c}({f})" for c, f in agg_map.items()))
+        else:
+            st.info("다른 속성 컬럼이 없어요. 면적 합계만으로 진행합니다.")
+
+        if output_format == "SHP":
+            st.caption("⚠️ SHP는 컬럼명이 짧게 잘릴 수 있어요(한글 3~5자). 새 컬럼명을 온전히 두려면 **GPKG** 저장을 권장합니다.")
+
+        if st.button("실행 (도형 유지)", type="primary"):
+            if not agg_map and not agg_add_area:
+                st.warning("‘면적 계산’을 켜거나, ‘합칠 속성 고르기’에서 최소 1개를 `제외`가 아닌 값으로 바꿔 주세요.")
+                st.stop()
+            if out_dir.exists():
+                shutil.rmtree(out_dir)
+            out_dir.mkdir(parents=True)
+            out_path = output_dataset_path(out_dir, f"{layer.name}_agg_by_{column}", output_format)
+            before_n = ogr_layer_stats(layer.path, encoding, layer.sublayer).get("features")
+            ok, out_path, log, new_cols = aggregate_keep_geometry(
+                layer, column, out_path, output_format, encoding, target_epsg or None, agg_map,
+                bool(agg_add_area), int(agg_area_dec), output_encoding)
+            if ok:
+                after_n = ogr_layer_stats(out_path).get("features")
+                st.success(f"완료 — 추가된 컬럼: {', '.join(new_cols) if new_cols else '없음'}")
+                if isinstance(before_n, int) and isinstance(after_n, int):
+                    if before_n == after_n:
+                        st.info(f"✅ 폴리곤 개수 그대로 유지: {before_n} → {after_n} (도형 안 바뀜)")
+                    else:
+                        st.error(f"⚠️ 개수가 달라졌습니다: {before_n} → {after_n}. 로그를 확인하세요.")
+                if out_path.suffix.lower() == ".gpkg" and output_format == "SHP":
+                    st.warning("SHP 저장에 실패해 GPKG로 대체 저장했습니다(QGIS에서 동일하게 열립니다).")
+                filename, data = download_for_path(out_path)
+                st.download_button("결과 다운로드", data, filename)
+            else:
+                st.error("실패")
+            st.code(log or "로그 없음")
+            st.download_button("작업 로그 다운로드", log or "로그 없음", "merge_agg_log.txt", key="merge_agg_log_dl")
+
     else:
         labels = st.multiselect("병합할 레이어", layer_options(layers), default=layer_options(layers), key="merge_many_layers")
         if st.button("여러 레이어 병합 실행", type="primary"):

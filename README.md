@@ -731,11 +731,11 @@ ogrinfo: C:\Program Files\QGIS 3.30.3\bin\ogrinfo.exe
 - SHP 내부 컬럼값 기준 병합은 기준 컬럼과 geometry 중심으로 결과를 만듭니다.
 - 병합 시 모든 속성 컬럼을 어떻게 집계할지는 아직 옵션화하지 않았습니다.
 
-### 🔴 알려진 이슈(미해결, 2026-07-03)
+### ✅ 해결된 이슈(2026-07-06): dissolve 결과 폴리곤 도형 깨짐
 
-- **dissolve(한 SHP 내 컬럼값 기준 병합) 결과 폴리곤 선형이 깨짐.** 텍스트(속성)는 정상인데 도형 경계선이 이상하게 나옴.
-  - 원인: **`ST_Union` 연산 자체**(결과를 GPKG로 출력해도 동일하게 깨지므로 GPKG→SHP 변환 문제 아님). 원본 폴리곤의 위상 오류(자기교차/겹침/미세 슬리버)를 복구하지 않고 union하면 GEOS가 깨진 결과를 냄. 현재 `-makevalid`는 union 다음에 적용돼 순서가 비효율적.
-  - 수정 방향(다음 작업): dissolve를 "복구 먼저 → union"으로. `ST_Union(ST_MakeValid(geometry))` 또는 2단계(원본 makevalid로 GPKG 생성 → 그 GPKG에서 `ST_Union GROUP BY`). 대상 함수 `dissolve_one_layer`, 참고 패턴 `convert_layer_safe`. 상세는 [작업로그.md](작업로그.md) "미해결/다음 작업" 참고.
+- 증상(과거): dissolve 결과 속성은 정상인데 폴리곤 경계선이 스파이크/불량으로 깨짐.
+- 원인: 원본 폴리곤의 위상 오류(자기교차/겹침/슬리버)를 **복구하지 않고** `ST_Union`하면 GEOS가 깨진 결과를 냄.
+- 해결: `dissolve_one_layer`를 **2단계**로 재작성 — ① `-makevalid`로 원본 도형 복구(UTF-8 GPKG, 네이티브 좌표, `-lco GEOMETRY_NAME=geometry`) → ② 복구본에서 `ST_Union ... GROUP BY` + 최종 `-makevalid`(+선택 재투영). 복구는 항상 수행(makevalid 체크와 무관). 바깥 윤곽선은 보존되고 인접 도형의 공유 내부 경계만 제거됨. 로컬 GDAL 3.7에서 위상 오류 테스트셋으로 end-to-end 검증 완료. 상세는 [작업로그.md](작업로그.md) 2026-07-06 참고.
 
 ## 향후 보강하면 좋은 기능
 
