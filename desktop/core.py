@@ -1023,21 +1023,30 @@ def merge_layers(
         return False, out_path, "ogr2ogr을 찾을 수 없습니다."
     logs: list[str] = []
 
+    def note(message: str) -> None:
+        """진단 문구를 반환 로그와 GUI 로그 양쪽에 남깁니다.
+
+        데스크톱 앱은 `_log` 훅으로 흘러온 것만 화면에 보여주므로, 반환 문자열에만 담으면
+        좌표계 자동 통일·도형 혼합 안내가 사용자 눈에 안 보입니다.
+        """
+        logs.append(message)
+        _log(message)
+
     # ── 좌표계 통일 대상 결정 ──
     codes = [layer_epsg(item.path, item.sublayer) for item in layers]
     unify = target_epsg or None
     if not unify and len({code for code in codes if code}) > 1:
         unify = codes[0]
         if unify:
-            logs.append(f"[좌표계] 입력 좌표계가 서로 다릅니다({', '.join(code or '없음' for code in codes)}). "
-                        f"첫 레이어 기준 EPSG:{unify}로 자동 통일합니다.")
+            note(f"[좌표계] 입력 좌표계가 서로 다릅니다({', '.join(code or '없음' for code in codes)}). "
+                 f"첫 레이어 기준 EPSG:{unify}로 자동 통일합니다.")
         else:
-            logs.append("⚠️ [좌표계] 입력 좌표계가 서로 다른데 첫 레이어에 좌표계 정보(.prj)가 없어 "
-                        "자동 통일을 못 했습니다. 목표 EPSG에 5186 등을 직접 지정하세요.")
+            note("⚠️ [좌표계] 입력 좌표계가 서로 다른데 첫 레이어에 좌표계 정보(.prj)가 없어 "
+                 "자동 통일을 못 했습니다. 목표 EPSG에 5186 등을 직접 지정하세요.")
     missing = [item.name for item, code in zip(layers, codes) if not code]
     if missing and unify:
-        logs.append(f"⚠️ [좌표계] 좌표계 정보(.prj)가 없는 레이어: {', '.join(missing)} "
-                    "→ 재투영이 안 되거나 실패할 수 있습니다.")
+        note(f"⚠️ [좌표계] 좌표계 정보(.prj)가 없는 레이어: {', '.join(missing)} "
+             "→ 재투영이 안 되거나 실패할 수 있습니다.")
 
     # ── 도형 타입 혼합 여부 ──
     families = [layer_geom_family(item.path, item.sublayer) for item in layers]
@@ -1046,12 +1055,12 @@ def merge_layers(
     save_format = output_format
     if mixed:
         detail = ", ".join(f"{item.name}={fam}" for item, fam in zip(layers, families))
-        logs.append(f"[도형] 도형 타입이 섞여 있습니다({detail}).")
+        note(f"[도형] 도형 타입이 섞여 있습니다({detail}).")
         if output_format == "SHP":
             save_format = "GPKG"
             out_path = out_path.with_suffix(".gpkg")
-            logs.append("⚠️ [도형] SHP은 점/선/면을 한 파일에 담지 못해 일부가 버려집니다. "
-                        "손실 없이 담기 위해 GPKG로 저장합니다(QGIS에서 동일하게 열립니다).")
+            note("⚠️ [도형] SHP은 점/선/면을 한 파일에 담지 못해 일부가 버려집니다. "
+                 "손실 없이 담기 위해 GPKG로 저장합니다(QGIS에서 동일하게 열립니다).")
 
     temp_gpkg = out_path if save_format == "GPKG" else out_path.with_suffix(".gpkg")
     if temp_gpkg.exists():
