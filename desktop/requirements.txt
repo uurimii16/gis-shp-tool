@@ -1,0 +1,8 @@
+# 실행에 필요한 것
+tkinterdnd2      # 드래그앤드롭(없어도 앱은 돌아갑니다 — 버튼으로만 파일 넣기)
+# 그 외 외부 패키지 없음 (표준 라이브러리 tkinter 사용, pandas·streamlit 불필요)
+# 실제 좌표변환/병합/분할은 QGIS에 들어있는 GDAL(ogr2ogr.exe)이 수행합니다.
+
+# 빌드할 때만 필요
+pyinstaller      # exe 만들기
+pillow           # 아이콘(icon.ico) 생성 — icon.ico가 이미 있으면 불필요

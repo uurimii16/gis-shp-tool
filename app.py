@@ -196,23 +196,39 @@ def reset_workspace() -> None:
     st.session_state.layers = []
 
 
-def save_uploads(files) -> Path:
+def save_uploads(files) -> tuple[Path, list[str]]:
+    """업로드 파일을 작업 폴더에 저장합니다. 반환: (입력 폴더, 이름이 겹친 파일 목록)
+
+    시군구별로 받은 `연속지적도.shp`처럼 **파일명이 같은 SHP을 여러 개 올리는 일이 흔한데**,
+    예전에는 전부 한 폴더에 이름 그대로 저장해 나중 파일이 앞 파일을 조용히 덮어썼습니다
+    (병합 목록에 아예 안 나타남). 이제 같은 이름이 다시 오면 `중복2/`, `중복3/` 하위 폴더로
+    분리합니다. SHP은 .shp/.shx/.dbf/.prj가 **같은 폴더에 함께 있어야** 하므로,
+    확장자별로 몇 번째 등장인지를 세어 같은 순번끼리 같은 폴더에 모읍니다.
+    """
     root = session_root()
     input_dir = root / "input"
     if input_dir.exists():
         shutil.rmtree(input_dir)
     input_dir.mkdir(parents=True, exist_ok=True)
 
+    seen: dict[str, int] = {}      # (파일명 소문자) -> 지금까지 등장 횟수
+    duplicates: list[str] = []
     for uploaded in files:
-        target = input_dir / uploaded.name
-        target.parent.mkdir(parents=True, exist_ok=True)
+        key = uploaded.name.casefold()
+        nth = seen.get(key, 0)
+        seen[key] = nth + 1
+        target_dir = input_dir if nth == 0 else input_dir / f"중복{nth + 1}"
+        if nth > 0 and uploaded.name not in duplicates:
+            duplicates.append(uploaded.name)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / uploaded.name
         target.write_bytes(uploaded.getbuffer())
         if target.suffix.lower() == ".zip":
-            extract_dir = input_dir / target.stem
+            extract_dir = target_dir / target.stem
             extract_dir.mkdir(exist_ok=True)
             with zipfile.ZipFile(target) as zf:
                 zf.extractall(extract_dir)
-    return input_dir
+    return input_dir, duplicates
 
 
 def gpkg_layer_names(path: Path) -> list[str]:
@@ -275,6 +291,17 @@ def discover_layers(input_dir: Path) -> list[LayerInfo]:
         else:
             # ogrinfo 미탐색/실패 시 기존처럼 파일 단위 단일 레이어로 처리
             layers.append(LayerInfo(name=gpkg.stem, path=gpkg, kind="GPKG", folder=gpkg.parent))
+
+    # 이름이 겹치는 레이어는 폴더명을 앞에 붙여 구분합니다(같은 파일명을 여러 개 올린 경우).
+    counts: dict[str, int] = {}
+    for item in layers:
+        counts[item.name] = counts.get(item.name, 0) + 1
+    for item in layers:
+        if counts[item.name] > 1 and item.folder != input_dir:
+            try:
+                item.name = f"{item.folder.relative_to(input_dir).as_posix()}/{item.name}"
+            except ValueError:
+                item.name = f"{item.folder.name}/{item.name}"
     return layers
 
 
@@ -503,6 +530,110 @@ def ogr_layer_stats(path: Path, input_encoding: str | None = None, sublayer: str
     return stats
 
 
+# ogrinfo -so 의 속성 컬럼 줄 형식: `NM: String (80.0)` / `area_m2: Real (24.15)`
+# (들여쓰기 없는 줄 + 끝이 `(폭.소수점)` 인 것만 필드로 인정 → WKT·Extent·Metadata 줄 제외)
+FIELD_LINE_RE = re.compile(r"^([^\s:][^:]*):\s+\w+(?:\([^)]*\))?\s+\(\d+\.\d+\)\s*$")
+
+
+def layer_field_names(path: Path, layer: str | None = None) -> list[str]:
+    """레이어의 속성 컬럼명을 ogrinfo로 실제 확인해 순서대로 돌려줍니다.
+
+    DBF만 읽는 `columns_for_layer`와 달리 SHP·GPKG 모두에서 동작합니다.
+    """
+    _, ogrinfo = gdals()
+    if not ogrinfo or not path.exists():
+        return []
+    ok, output = run_cmd([ogrinfo, "-so", "-al", str(path)] + ([layer] if layer else []))
+    if not ok:
+        return []
+    return [m.group(1).strip() for m in (FIELD_LINE_RE.match(line) for line in output.splitlines()) if m]
+
+
+def layer_epsg(path: Path, sublayer: str | None = None) -> str | None:
+    """레이어 좌표계의 EPSG 코드를 돌려줍니다(없으면 None).
+
+    WKT2는 `ID["EPSG",5186]`, 구형 WKT는 `AUTHORITY["EPSG","5186"]` 형식이고
+    **마지막에 나오는 것**이 좌표계 자체의 코드입니다(앞쪽은 파라미터·타원체 코드).
+    """
+    _, ogrinfo = gdals()
+    if not ogrinfo or not path.exists():
+        return None
+    ok, output = run_cmd([ogrinfo, "-so", "-al", str(path)] + ([sublayer] if sublayer else []))
+    if not ok:
+        return None
+    codes = re.findall(r'(?:ID\["EPSG",\s*(\d+)\]|AUTHORITY\["EPSG",\s*"(\d+)"\])', output)
+    for primary, legacy in reversed(codes):
+        return primary or legacy
+    return None
+
+
+# 도형 타입을 SHP가 구분하는 큰 갈래(점/선/면)로 정규화
+GEOM_FAMILY = {"POINT": "점", "MULTIPOINT": "점",
+               "LINESTRING": "선", "MULTILINESTRING": "선",
+               "POLYGON": "면", "MULTIPOLYGON": "면"}
+
+
+def layer_geom_family(path: Path, sublayer: str | None = None) -> str:
+    """레이어 도형 타입을 '점/선/면/기타'로 돌려줍니다(SHP 혼합 저장 불가 판정용)."""
+    _, ogrinfo = gdals()
+    if not ogrinfo or not path.exists():
+        return "기타"
+    ok, output = run_cmd([ogrinfo, "-so", "-al", str(path)] + ([sublayer] if sublayer else []))
+    if not ok:
+        return "기타"
+    match = re.search(r"^Geometry:\s*(.+)$", output, re.MULTILINE)
+    if not match:
+        return "기타"
+    raw = re.sub(r"^(3D|Measured|3D Measured)\s+", "", match.group(1).strip(), flags=re.I)
+    return GEOM_FAMILY.get(raw.upper().replace(" ", ""), "기타")
+
+
+def log_problems(log: str) -> list[str]:
+    """처리 로그에서 ERROR/Warning 줄만 뽑아냅니다(조용히 지나가는 실패를 화면에 띄우기 위함)."""
+    seen: list[str] = []
+    for line in (log or "").splitlines():
+        text = line.strip()
+        if not text or not re.search(r"\b(ERROR|Warning)\b", text):
+            continue
+        if "tms_NZTM2000" in text or "GDAL_DATA is not defined" in text:
+            continue  # 결과와 무관한 GDAL 설치 잡음
+        if text not in seen:
+            seen.append(text)
+    return seen
+
+
+def decimal_cast_args(
+    gpkg_path: Path,
+    source_layer: str | None,
+    decimal_fields: dict[str, int] | None,
+) -> tuple[list[str], list[str]]:
+    """SHP 저장 시 지정 컬럼의 소수점 자리수를 고정하는 ogr2ogr 인자를 만듭니다.
+
+    반환: (추가 인자, 소스 인자). 적용 대상이 없으면 ([], []).
+    `-dialect OGRSQL`을 **반드시 명시**해야 합니다. GPKG를 소스로 `-sql`을 주면 GDAL이
+    GPKG 내장 SQLite로 넘겨버려 `CAST(... AS numeric(w,d))`의 자리수 지정이 무시됩니다.
+    OGRSQL은 `SELECT *, 식` 형태를 지원하지 않아 컬럼을 전부 나열합니다.
+    """
+    if not decimal_fields:
+        return [], []
+    fields = layer_field_names(gpkg_path, source_layer)
+    targets = {name: dec for name, dec in decimal_fields.items() if name in fields}
+    if not targets:
+        return [], []
+    selects = []
+    for name in fields:
+        ident = quote_ident(name)
+        if name in targets:
+            dec = max(int(targets[name]), 0)
+            # 폭은 넉넉히(정수부 최대 18자리 + 소수부). SHP 실수 필드 최대 폭은 24.
+            width = min(18 + dec, 24)
+            selects.append(f"CAST({ident} AS numeric({width},{dec})) AS {ident}")
+        else:
+            selects.append(ident)
+    sql = f"SELECT {', '.join(selects)} FROM {quote_ident(source_layer or gpkg_path.stem)}"
+    return ["-dialect", "OGRSQL", "-sql", sql], [str(gpkg_path)]
+
+
 def gpkg_to_final(
     gpkg_path: Path,
     source_layer: str | None,
@@ -510,11 +641,18 @@ def gpkg_to_final(
     output_format: str,
     output_encoding: str,
     extra_args: list[str] | None = None,
+    decimal_fields: dict[str, int] | None = None,
 ) -> tuple[bool, Path, str]:
     """UTF-8 GPKG(중간 결과)를 최종 형식으로 저장합니다.
 
     SHP 저장이 실패하면 자동으로 GPKG로 대체 저장해, 어떤 경우에도 결과물이 남도록 합니다.
     실제 저장된 경로를 함께 반환합니다(대체 시 .gpkg 경로).
+
+    decimal_fields: {컬럼명: 소수점자리수}. SHP(DBF)는 컬럼마다 '소수점 몇 자리'를 파일에
+      기록하는데, SQL로 계산해 만든 컬럼은 그 정보가 없어 GDAL이 기본값(폭 24 / 소수점 15)을
+      씁니다. 그래서 ROUND(x, 2)로 반올림해도 DBF에는 `11027.299999999999272`처럼 15자리가
+      그대로 박힙니다. 최종 저장 때 `CAST(x AS numeric(w,d))`로 **필드 정의 자체**를 바꿔야
+      지정한 자리수로 저장됩니다. (GPKG는 소수점 자리 개념이 없어 값 그대로 두면 됩니다.)
     """
     ogr2ogr, _ = gdals()
     if not ogr2ogr:
@@ -524,7 +662,9 @@ def gpkg_to_final(
         args = [ogr2ogr, "-overwrite", "-f", "GPKG"] + (extra_args or []) + [str(out_path), *src_tail]
         ok, log = run_cmd(args)
         return ok, out_path, log
-    args = [ogr2ogr, "-overwrite", "-f", "ESRI Shapefile", "-lco", f"ENCODING={output_encoding}"] + (extra_args or []) + [str(out_path), *src_tail]
+    cast_args, cast_tail = decimal_cast_args(gpkg_path, source_layer, decimal_fields)
+    args = ([ogr2ogr, "-overwrite", "-f", "ESRI Shapefile", "-lco", f"ENCODING={output_encoding}"]
+            + cast_args + (extra_args or []) + [str(out_path), *(cast_tail if cast_args else src_tail)])
     ok, log = run_cmd(args)
     if ok:
         return True, out_path, log
@@ -544,6 +684,7 @@ def sqlite_sql_to_output(
     output_encoding: str,
     oo_encoding: str | None = None,
     extra_args: list[str] | None = None,
+    decimal_fields: dict[str, int] | None = None,
 ) -> tuple[bool, Path, str]:
     """SQLite dialect(공간함수 ST_*) 결과를 인코딩 안전하게 저장하고 실제 경로를 반환합니다.
 
@@ -567,7 +708,9 @@ def sqlite_sql_to_output(
     ok, l1 = run_cmd(a1)
     if not ok:
         return False, out_path, l1
-    ok2, actual, l2 = gpkg_to_final(tmp, "result", out_path, output_format, output_encoding)
+    ok2, actual, l2 = gpkg_to_final(
+        tmp, "result", out_path, output_format, output_encoding, decimal_fields=decimal_fields
+    )
     return ok2, actual, (l1 + "\n" + l2).strip()
 
 
@@ -604,6 +747,7 @@ def add_area_column(
 
     좌표계가 미터 기반 투영좌표계(EPSG:5186 등)일 때만 ㎡가 정확합니다.
     레이어명·지오메트리 컬럼명은 파일에서 실제로 확인합니다(GPKG는 파일명과 다를 수 있음).
+    소수점 자리수는 ROUND(계산)와 decimal_fields(저장 형식) 양쪽에 적용해야 실제로 반영됩니다.
     """
     layer_name, geom_col = resolve_layer_and_geom(src_path)
     dec = max(int(decimals), 0)
@@ -612,6 +756,7 @@ def add_area_column(
     ok, actual, log = sqlite_sql_to_output(
         src_path, sql, out_path, output_format, output_encoding,
         oo_encoding=(output_encoding if src_path.suffix.lower() == ".shp" else None),
+        decimal_fields={field: dec},
     )
     return ok, (actual if ok else src_path), log
 
@@ -793,7 +938,9 @@ def aggregate_keep_geometry(
     if not ok:
         return False, out_path, f"[① 원본읽기 실패] {log1}", []
 
-    existing = set(columns_for_layer(layer, input_encoding))
+    # 중복 방지 기준은 ①에서 만든 GPKG의 실제 컬럼으로 확인합니다.
+    # (columns_for_layer는 DBF만 읽어 GPKG 입력이면 빈 목록 → 이름 충돌을 못 걸러냄)
+    existing = set(layer_field_names(work, "src")) or set(columns_for_layer(layer, input_encoding))
     used: list[str] = []          # 새로 만든 모든 컬럼명(중복 방지용)
 
     def uniq(base: str) -> str:
@@ -804,6 +951,7 @@ def aggregate_keep_geometry(
         return name
 
     dec = max(int(area_decimals), 0)
+    area_fields: dict[str, int] = {}   # SHP 저장 시 소수점 자리수를 고정할 컬럼
     main_selects: list[str] = []   # s(각 피처)에서 바로 계산하는 컬럼 (per-feature 면적)
     group_selects: list[str] = []  # 서브쿼리(그룹 집계) 컬럼
     group_out: list[str] = []      # 그룹 결과에서 가져올 컬럼명
@@ -817,6 +965,7 @@ def aggregate_keep_geometry(
         a_sum = uniq("area_sum")
         group_selects.append(f"ROUND(ST_Area(ST_Union(geometry)), {dec}) AS {quote_ident(a_sum)}")
         group_out.append(a_sum)
+        area_fields = {a_each: dec, a_sum: dec}
 
     for col, func in picked.items():
         name = uniq(f"{col}_{AGG_SUFFIX.get(func, func)}")
@@ -833,6 +982,7 @@ def aggregate_keep_geometry(
     # 재투영은 ①에서 끝냈으므로 ②에서는 좌표계 변경 없음
     ok2, actual, log2 = sqlite_sql_to_output(
         work, sql, out_path, output_format, output_encoding, oo_encoding=None,
+        decimal_fields=area_fields,
     )
     return ok2, actual, f"[① 원본읽기/재투영] {log1}\n[② 값 되붙이기] {log2}".strip(), used
 
@@ -846,13 +996,56 @@ def merge_layers(
     output_encoding: str,
     makevalid: bool = False,
 ) -> tuple[bool, Path, str]:
+    """여러 레이어를 하나로 이어붙입니다(-append).
+
+    조용히 잘못되는 두 가지를 막습니다.
+    - **좌표계 통일**: `-append`는 재투영을 하지 않습니다. 목표 EPSG를 안 넣고 좌표계가
+      다른 레이어를 붙이면 GDAL이 경고 없이 원본 좌표값을 그대로 밀어넣어, 개수는 맞는데
+      도형만 지구 반대편에 찍힙니다. 그래서 목표가 없으면 **첫 레이어 좌표계로 자동 통일**합니다.
+    - **도형 타입 혼합**: SHP은 한 파일에 점/선/면을 섞어 담지 못합니다. 섞였는데 SHP으로
+      저장하면 첫 레이어와 타입이 다른 피처가 통째로 버려집니다(순서에 따라 결과가 뒤바뀜).
+      섞인 경우 GPKG 레이어를 `-nlt GEOMETRY`로 만들고 GPKG로 저장합니다.
+    """
     ogr2ogr, _ = gdals()
     if not ogr2ogr:
         return False, out_path, "ogr2ogr을 찾을 수 없습니다."
-    temp_gpkg = out_path if output_format == "GPKG" else out_path.with_suffix(".gpkg")
+    logs = []
+
+    # ── 좌표계 통일 대상 결정 ──
+    codes = [layer_epsg(item.path, item.sublayer) for item in layers]
+    unify = target_epsg or None
+    if not unify and len({code for code in codes if code}) > 1:
+        unify = codes[0]
+        if unify:
+            logs.append(f"[좌표계] 입력 좌표계가 서로 다릅니다({', '.join(code or '없음' for code in codes)}). "
+                        f"첫 레이어 기준 EPSG:{unify}로 자동 통일합니다.")
+        else:
+            logs.append("⚠️ [좌표계] 입력 좌표계가 서로 다른데 첫 레이어에 좌표계 정보(.prj)가 없어 "
+                        "자동 통일을 못 했습니다. '병합 전 목표 EPSG 통일'에 5186 등을 직접 넣으세요.")
+    missing = [item.name for item, code in zip(layers, codes) if not code]
+    if missing and unify:
+        logs.append(f"⚠️ [좌표계] 좌표계 정보(.prj)가 없는 레이어: {', '.join(missing)} "
+                    "→ 재투영이 안 되거나 실패할 수 있습니다.")
+
+    # ── 도형 타입 혼합 여부 ──
+    families = [layer_geom_family(item.path, item.sublayer) for item in layers]
+    mixed = len(set(families)) > 1
+    geom_arg = "GEOMETRY" if mixed else "PROMOTE_TO_MULTI"
+    save_format = output_format
+    if mixed:
+        detail = ", ".join(f"{item.name}={fam}" for item, fam in zip(layers, families))
+        logs.append(f"[도형] 도형 타입이 섞여 있습니다({detail}).")
+        if output_format == "SHP":
+            save_format = "GPKG"
+            out_path = out_path.with_suffix(".gpkg")
+            logs.append("⚠️ [도형] SHP은 점/선/면을 한 파일에 담지 못해 일부가 버려집니다. "
+                        "손실 없이 담기 위해 GPKG로 저장합니다(QGIS에서 동일하게 열립니다). "
+                        "SHP이 꼭 필요하면 '분할' 탭에서 타입별로 나눠 저장하세요.")
+
+    temp_gpkg = out_path if save_format == "GPKG" else out_path.with_suffix(".gpkg")
     if temp_gpkg.exists():
         temp_gpkg.unlink()
-    logs = []
+
     for idx, layer in enumerate(layers):
         args = [ogr2ogr]
         if idx == 0:
@@ -861,17 +1054,17 @@ def merge_layers(
             args += ["-update", "-append", "-f", "GPKG", "-addfields"]
         if layer.kind == "SHP" and input_encoding:
             args += ["-oo", f"ENCODING={input_encoding}"]
-        if target_epsg:
-            args += ["-t_srs", f"EPSG:{target_epsg}"]
+        if unify:
+            args += ["-t_srs", f"EPSG:{unify}"]
         if makevalid:
             args += ["-makevalid"]
-        args += ["-nln", "merged", "-nlt", "PROMOTE_TO_MULTI", str(temp_gpkg), *ogr_source_args(layer)]
+        args += ["-nln", "merged", "-nlt", geom_arg, str(temp_gpkg), *ogr_source_args(layer)]
         ok, output = run_cmd(args)
         logs.append(f"[{layer.name}] {output}")
         if not ok:
             return False, out_path, "\n".join(logs)
 
-    if output_format == "SHP":
+    if save_format == "SHP":
         # temp_gpkg(UTF-8) -> SHP, 실패 시 GPKG로 자동 대체
         ok, actual, output = gpkg_to_final(temp_gpkg, "merged", out_path, "SHP", output_encoding)
         logs.append(output)
@@ -1019,6 +1212,20 @@ def join_code_table(
     return ok, actual, "\n".join(logs)
 
 
+def render_log_problems(log: str) -> None:
+    """로그 속 ERROR/Warning을 접힌 로그 밖으로 끌어내 보여줍니다.
+
+    GDAL은 '값이 잘렸다', '타입이 안 맞아 0으로 넣었다' 같은 **데이터가 조용히 망가지는
+    상황**을 대부분 Warning으로만 알리고 성공(exit 0)으로 끝냅니다. 접힌 로그 안에만 있으면
+    아무도 못 보므로 결과 바로 아래에 요약해 띄웁니다.
+    """
+    problems = log_problems(log)
+    if not problems:
+        return
+    st.warning(f"처리 중 경고/오류 {len(problems)}건이 있었습니다. 결과가 의도와 다르면 아래를 확인하세요.")
+    st.code("\n".join(problems[:20]) + ("\n… (이하 로그 참고)" if len(problems) > 20 else ""))
+
+
 def render_layer_status(layers: list[LayerInfo], encoding: str) -> None:
     if not layers:
         st.info("왼쪽에서 SHP zip, SHP 구성 파일, GPKG 파일을 업로드하세요.")
@@ -1146,6 +1353,7 @@ def render_convert_tab(layers: list[LayerInfo], encoding: str, output_encoding: 
         else:
             st.error("변환 결과가 없습니다. 로그를 확인하세요.")
         log_text = "\n\n".join(logs) or "로그 없음"
+        render_log_problems(log_text)
         with st.expander("처리 로그", expanded=not results or dropped_any):
             st.code(log_text)
         st.download_button("작업 로그 다운로드", log_text, "convert_log.txt", key="convert_log_dl")
@@ -1220,6 +1428,7 @@ def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
                 st.download_button("결과 다운로드", data, filename)
             else:
                 st.error("병합 실패")
+            render_log_problems(log or "")
             st.code(log or "로그 없음")
             st.download_button("작업 로그 다운로드", log or "로그 없음", "merge_dissolve_log.txt", key="merge_one_log_dl")
 
@@ -1293,11 +1502,37 @@ def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
                 st.download_button("결과 다운로드", data, filename)
             else:
                 st.error("실패")
+            render_log_problems(log or "")
             st.code(log or "로그 없음")
             st.download_button("작업 로그 다운로드", log or "로그 없음", "merge_agg_log.txt", key="merge_agg_log_dl")
 
     else:
         labels = st.multiselect("병합할 레이어", layer_options(layers), default=layer_options(layers), key="merge_many_layers")
+        preview = selected_layers(labels, layers)
+        if preview:
+            rows = [{"레이어": item.name,
+                     "좌표계": (f"EPSG:{code}" if (code := layer_epsg(item.path, item.sublayer)) else "없음(.prj 확인)"),
+                     "도형": layer_geom_family(item.path, item.sublayer)} for item in preview]
+            st.caption("선택한 레이어 상태 — **좌표계와 도형이 섞이면 조용히 누락되므로 미리 확인하세요.**")
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            crs_set = {row["좌표계"] for row in rows}
+            geom_set = {row["도형"] for row in rows}
+            if len(crs_set) > 1 and not target_epsg:
+                st.warning(
+                    f"좌표계가 서로 다릅니다({', '.join(sorted(crs_set))}). `-append`는 재투영을 하지 않아 "
+                    "그냥 붙이면 개수는 맞는데 도형이 엉뚱한 위치에 찍힙니다. "
+                    "**첫 레이어 좌표계로 자동 통일해 진행**하지만, 위 `병합 전 목표 EPSG 통일`에 "
+                    "`5186`처럼 원하는 좌표계를 직접 넣는 것을 권합니다."
+                )
+            if "없음(.prj 확인)" in crs_set:
+                st.warning("좌표계 정보(.prj)가 없는 레이어가 있습니다. 재투영이 실패할 수 있으니 "
+                           "`좌표계 변환` 탭에서 '원본 EPSG 강제 지정'으로 먼저 좌표계를 넣어주세요.")
+            if len(geom_set) > 1:
+                st.warning(
+                    f"도형 타입이 섞여 있습니다({', '.join(sorted(geom_set))}). SHP은 점/선/면을 "
+                    "한 파일에 담지 못해 다른 타입이 통째로 버려집니다. **손실 없이 담기 위해 "
+                    "GPKG로 저장합니다.**"
+                )
         if st.button("여러 레이어 병합 실행", type="primary"):
             chosen = selected_layers(labels, layers)
             if len(chosen) < 2:
@@ -1320,6 +1555,7 @@ def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
                     st.caption(f"입력 feature 합계: {total} → 병합 결과: {merged_n}")
             else:
                 st.error("병합 실패")
+            render_log_problems(log or "")
             st.code(log or "로그 없음")
             st.download_button("작업 로그 다운로드", log or "로그 없음", "merge_layers_log.txt", key="merge_many_log_dl")
 
@@ -1536,6 +1772,7 @@ def render_join_tab(layers: list[LayerInfo], encoding: str, output_encoding: str
         else:
             st.error("코드 결합 실패. 로그를 확인하세요.")
         with st.expander("처리 로그", expanded=not ok):
+            render_log_problems(log or "")
             st.code(log or "로그 없음")
         st.download_button("작업 로그 다운로드", log or "로그 없음", "codejoin_log.txt", key="join_log_dl")
 
@@ -1553,8 +1790,17 @@ def main() -> None:
         )
         if st.button("업로드 파일 읽기", type="primary", disabled=not files):
             reset_workspace()
-            input_dir = save_uploads(files)
+            input_dir, duplicates = save_uploads(files)
             st.session_state.layers = discover_layers(input_dir)
+            st.session_state.upload_duplicates = duplicates
+        if st.session_state.get("upload_duplicates"):
+            st.warning(
+                "이름이 같은 파일을 여러 개 올렸습니다: "
+                + ", ".join(st.session_state["upload_duplicates"])
+                + "\n\n덮어쓰지 않도록 `중복2/` 같은 하위 폴더로 나눠 담았습니다. "
+                "레이어 목록에서 폴더명이 붙은 항목을 확인하세요. "
+                "가장 확실한 방법은 **폴더째 ZIP으로 묶어 올리는 것**입니다."
+            )
         if st.button("작업 초기화"):
             reset_workspace()
             st.rerun()

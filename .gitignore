@@ -9,3 +9,10 @@ __pycache__/
 *.log
 streamlit*.log
 st_*.log
+
+# 데스크톱 exe 빌드 산출물(총 84MB — 소스만 저장소에 두고 결과물은 제외)
+desktop/build/
+desktop/dist/
+desktop/dist_new/
+# 로컬 자가진단 결과(내 PC 경로가 들어감)
+desktop/진단결과.txt
