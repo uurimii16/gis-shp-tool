@@ -1,6 +1,8 @@
 config.txt
+진단결과.txt
 build/
 dist/
+dist_*/
 *.spec
 __pycache__/
 *.pyc
