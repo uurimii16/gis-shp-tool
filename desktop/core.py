@@ -359,12 +359,31 @@ def _gdal_env(exe_path: str | None) -> dict[str, str]:
     env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
 
     root = bin_dir.parent
-    proj_dir = root / "share" / "proj"
-    gdal_data_dir = root / "share" / "gdal"
-    if proj_dir.exists():
-        env.setdefault("PROJ_LIB", str(proj_dir))
-    if gdal_data_dir.exists():
-        env.setdefault("GDAL_DATA", str(gdal_data_dir))
+    # 설치본마다 데이터 폴더 위치가 다릅니다.
+    #   QGIS 단독설치 : <root>\apps\gdal\share\gdal , <root>\share\proj
+    #   OSGeo4W       : <root>\share\gdal , <root>\share\proj (또는 apps\proj9\share\proj)
+    # 못 찾으면 GDAL이 "Cannot find tms_NZTM2000.json (GDAL_DATA is not defined)" 경고를
+    # 매번 띄웁니다(동작에는 지장 없지만 사용자가 불안해합니다).
+    gdal_candidates = [
+        root / "share" / "gdal",
+        root / "apps" / "gdal" / "share" / "gdal",
+        root / "apps" / "gdal-dev" / "share" / "gdal",
+    ]
+    proj_candidates = [
+        root / "share" / "proj",
+        root / "apps" / "proj" / "share" / "proj",
+        root / "apps" / "proj9" / "share" / "proj",
+        root / "apps" / "proj8" / "share" / "proj",
+        root / "apps" / "proj7" / "share" / "proj",
+    ]
+    for candidate in gdal_candidates:
+        if candidate.is_dir():
+            env.setdefault("GDAL_DATA", str(candidate))
+            break
+    for candidate in proj_candidates:
+        if candidate.is_dir():
+            env.setdefault("PROJ_LIB", str(candidate))
+            break
     return env
 
 
@@ -376,7 +395,10 @@ def run_cmd(args: list[str]) -> tuple[bool, str]:
     같은 이유로 실행 중인 프로세스를 붙잡고 있으므로 [취소]로 즉시 끊을 수 있습니다.
     """
     is_ogr2ogr = Path(args[0]).stem.lower() == "ogr2ogr" if args else False
-    if is_ogr2ogr and "-progress" not in args:
+    # 전체 개수를 미리 못 세는 경우(CSV 읽기, -sql 결과)는 GDAL이 진행률을 끄면서
+    # "Progress turned off…" 경고를 냅니다 → 그런 명령엔 아예 안 붙입니다(경고 제거).
+    no_fast_count = any(str(arg).lower().endswith(".csv") for arg in args[1:]) or "-sql" in args
+    if is_ogr2ogr and not no_fast_count and "-progress" not in args:
         args = [args[0], "-progress"] + list(args[1:])
     _log("$ " + " ".join(f'"{a}"' if " " in str(a) else str(a) for a in args))
 
@@ -651,9 +673,16 @@ def encoding_report(dbf_path: Path) -> list[dict[str, object]]:
 
 
 def best_encoding(report: list[dict[str, object]], candidates: list[str]) -> str:
+    """깨짐 점수가 가장 낮은 인코딩. 동점이면 후보 목록에서 앞선 것(= UTF-8-SIG 우선)."""
     valid = [row for row in report if isinstance(row["깨짐 의심 점수"], int) and row["깨짐 의심 점수"] < 9999]
     pool = valid or report
-    best = str(min(pool, key=lambda row: row["깨짐 의심 점수"])["인코딩"])
+
+    def rank(row: dict[str, object]) -> tuple[int, int]:
+        name = str(row["인코딩"])
+        order = candidates.index(name) if name in candidates else len(candidates)
+        return int(row["깨짐 의심 점수"]), order
+
+    best = str(min(pool, key=rank)["인코딩"])
     return best if best in candidates else candidates[0]
 
 
@@ -708,13 +737,22 @@ def unique_values(layer: LayerInfo, column: str, encoding: str, limit: int = 200
 
 # ────────────────────────────── CSV 코드표 ──────────────────────────────
 def read_csv_table(raw: bytes, encoding: str) -> Table:
-    """코드표 CSV를 지정 인코딩으로 읽습니다. 모든 값은 문자열(앞자리 0 보존)."""
+    """코드표 CSV를 지정 인코딩으로 읽습니다. 모든 값은 문자열(앞자리 0 보존).
+
+    ⚠️ BOM 주의: 엑셀이 저장한 CSV는 앞에 보이지 않는 표식(BOM, `EF BB BF`)이 붙습니다.
+    `UTF-8-SIG`로 읽으면 알아서 떨어지지만 그냥 `UTF-8`로 읽으면 **첫 컬럼명이 `﻿Code`가
+    됩니다.** 그 이름으로 SQL을 만들면 GDAL은 BOM을 떼고 `Code`로 읽어들이므로
+    `no such column: c.﻿Code` 오류가 났습니다(2026-07-29 실제 발생).
+    어느 인코딩으로 읽든 여기서 BOM을 떼어 이름이 흔들리지 않게 합니다.
+    """
     text = raw.decode(encoding, errors="replace")
+    if text.startswith("﻿"):
+        text = text[1:]
     reader = csv.reader(io.StringIO(text, newline=""))
     rows = list(reader)
     if not rows:
         return Table()
-    columns = [col.strip() for col in rows[0]]
+    columns = [col.strip().lstrip("﻿") for col in rows[0]]
     records = []
     for raw_row in rows[1:]:
         if not any(cell.strip() for cell in raw_row):

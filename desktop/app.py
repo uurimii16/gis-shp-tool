@@ -35,7 +35,7 @@ except Exception:  # 라이브러리 미설치 등
     HAS_DND = False
 
 APP_TITLE = "SHP 좌표변환·병합·분할 도구 (데스크톱)"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 QGIS_URL = "https://qgis.org/download/"
 
 # ----- 밝은 테마 색상 -----
