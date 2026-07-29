@@ -35,7 +35,7 @@ except Exception:  # 라이브러리 미설치 등
     HAS_DND = False
 
 APP_TITLE = "SHP 좌표변환·병합·분할 도구 (데스크톱)"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 QGIS_URL = "https://qgis.org/download/"
 
 # ----- 밝은 테마 색상 -----
@@ -431,6 +431,9 @@ class ShpToolApp(BASE_TK):
         ttk.Label(head, text="처리 로그", style="Head.TLabel").pack(side="left")
         ttk.Button(head, text="로그 저장", command=self.save_log).pack(side="right")
         ttk.Button(head, text="지우기", command=lambda: self.log_text.delete("1.0", "end")).pack(side="right", padx=6)
+        # 실행 중에만 켜지는 취소 버튼(누르면 GDAL 프로세스를 즉시 종료합니다)
+        self.cancel_button = ttk.Button(head, text="■ 작업 취소", command=self.cancel_job, state="disabled")
+        self.cancel_button.pack(side="right", padx=6)
 
         self.progress = ttk.Progressbar(wrap, mode="determinate", maximum=100)
         self.progress.pack(fill="x", pady=(6, 4))
@@ -899,22 +902,59 @@ class ShpToolApp(BASE_TK):
             self.show_gdal_help()
             return
         self.busy = True
-        self.set_status(f"{name} 실행 중…", 5)
+        core.CANCEL.reset()
+        core.PROGRESS.bind(self._on_progress)
+        self.job_started = time.time()
+        self.after(0, lambda: self.cancel_button.configure(state="normal"))
+        self.set_status(f"{name} 실행 중…", 1)
         self.log(f"\n===== {name} 시작 =====")
 
         def worker() -> None:
             try:
                 func()
+            except core.Cancelled:
+                self.log("⏹ 사용자가 작업을 취소했습니다. 결과 폴더에 미완성 파일이 남아 있을 수 있습니다.")
+                self.after(0, lambda: messagebox.showinfo("취소됨", f"{name}을(를) 취소했습니다."))
             except Exception as exc:  # 사용자에게 원인을 그대로 보여줍니다
                 self.log("[오류] " + "".join(traceback.format_exception_only(type(exc), exc)).strip())
                 self.log(traceback.format_exc())
                 self.after(0, lambda: messagebox.showerror("오류", f"{name} 중 오류가 발생했습니다.\n\n{exc}"))
             finally:
                 self.busy = False
-                self.set_status("대기 중", 100)
-                self.log(f"===== {name} 종료 =====")
+                core.PROGRESS.bind(None)
+                self.after(0, lambda: self.cancel_button.configure(state="disabled"))
+                took = time.time() - getattr(self, "job_started", time.time())
+                self.set_status(f"대기 중 (직전 작업 {self._pretty_time(took)})", 100)
+                self.log(f"===== {name} 종료 · {self._pretty_time(took)} 소요 =====")
 
         threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _pretty_time(seconds: float) -> str:
+        if seconds < 60:
+            return f"{seconds:.0f}초"
+        return f"{int(seconds // 60)}분 {int(seconds % 60)}초"
+
+    def _on_progress(self, percent: float, label: str, step: int, total: int) -> None:
+        """GDAL이 알려준 진행률을 상태줄·진행 막대에 옮깁니다(작업 스레드에서 호출됨)."""
+        elapsed = time.time() - getattr(self, "job_started", time.time())
+        eta = ""
+        if percent >= 3:
+            remain = elapsed * (100 - percent) / percent
+            if remain >= 3:
+                eta = f" · 남은 시간 약 {self._pretty_time(remain)}"
+        head = label or "작업"
+        step_text = f" ({step}/{total}단계)" if total > 1 else ""
+        self.set_status(f"{head}{step_text} · {percent:.0f}% · 경과 {self._pretty_time(elapsed)}{eta}", percent)
+
+    def cancel_job(self) -> None:
+        """실행 중인 GDAL 프로세스를 즉시 종료합니다."""
+        if not self.busy:
+            return
+        self.log("⏹ 취소 요청 — 실행 중인 GDAL 작업을 중단합니다…")
+        self.set_status("취소하는 중…", None)
+        self.cancel_button.configure(state="disabled")
+        core.CANCEL.cancel()
 
     def selected_layers(self, listbox: tk.Listbox) -> list[core.LayerInfo]:
         indexes = listbox.curselection()
@@ -1163,9 +1203,11 @@ class ShpToolApp(BASE_TK):
             out_dir = stamped_dir(self.out_base(), "변환")
             results: list[Path] = []
             dropped = False
+            # 레이어당 GDAL 명령 수: 안전 변환 2 + 면적 2(GPKG 경유 저장) — 어긋나도 자동 보정됩니다.
+            per_layer = (2 if safe else 1) + (2 if add_area else 0)
+            core.PROGRESS.begin(len(layers) * per_layer, "좌표계 변환")
             for index, layer in enumerate(layers, start=1):
-                self.set_status(f"변환 {index}/{len(layers)} · {layer.name}", index / len(layers) * 100)
-                self.log(f"\n--- {layer.name} ---")
+                self.log(f"\n--- {layer.name} ({index}/{len(layers)}) ---")
                 before = core.ogr_layer_stats(layer.path, in_enc, layer.sublayer)
                 out_path = core.output_dataset_path(out_dir, f"{layer.name}_{target}", fmt)
                 if safe:
@@ -1226,6 +1268,7 @@ class ShpToolApp(BASE_TK):
         def job() -> None:
             out_dir = stamped_dir(self.out_base(), "병합")
             if mode == "dissolve":
+                core.PROGRESS.begin(3 if add_area else 2, "도형 병합")
                 out_path = core.output_dataset_path(out_dir, f"{layer.name}_dissolved_by_{column}", fmt)
                 before_n = core.ogr_layer_stats(layer.path, in_enc, layer.sublayer).get("features")
                 ok, out_path, _log = core.dissolve_one_layer(
@@ -1241,6 +1284,7 @@ class ShpToolApp(BASE_TK):
                 self.finish(out_dir, "컬럼값 기준 병합 완료")
                 return
 
+            core.PROGRESS.begin(3, "속성 합치기")
             out_path = core.output_dataset_path(out_dir, f"{layer.name}_agg_by_{column}", fmt)
             before_n = core.ogr_layer_stats(layer.path, in_enc, layer.sublayer).get("features")
             ok, out_path, _log, new_cols = core.aggregate_keep_geometry(
@@ -1271,6 +1315,7 @@ class ShpToolApp(BASE_TK):
 
         def job() -> None:
             out_dir = stamped_dir(self.out_base(), "병합")
+            core.PROGRESS.begin(len(layers) + 1, "레이어 이어붙이기")
             out_path = core.output_dataset_path(out_dir, "merged_layers", fmt)
             ok, out_path, _log = core.merge_layers(layers, out_path, fmt, epsg, in_enc, out_enc, makevalid)
             if not ok:
@@ -1329,9 +1374,11 @@ class ShpToolApp(BASE_TK):
                     self.log(f"[{layer.name}] 분할할 값을 찾지 못했습니다.")
                     continue
                 self.log(f"\n--- {layer.name}: {len(values)}개 값으로 분할 ---")
+                # 값 1개 = GDAL 1회. 진행률·남은시간은 core.PROGRESS가 상태줄에 표시합니다.
+                core.PROGRESS.begin(len(values), f"분할 · {layer.name}")
 
                 def progress(done: int, total: int, value: str) -> None:
-                    self.set_status(f"분할 {layer.name} · {done}/{total} · {value}", done / total * 100)
+                    self.log(f"   [{done}/{total}] {value}")
 
                 outputs, _log = core.split_layer_by_values(
                     layer, column, values, out_dir / core.safe_name(layer.name), fmt,
@@ -1436,6 +1483,7 @@ class ShpToolApp(BASE_TK):
             out_dir = stamped_dir(self.out_base(), "코드결합")
             code_csv = out_dir / "codes_utf8.csv"
             core.write_csv_utf8(table, code_csv)
+            core.PROGRESS.begin(3, "코드 결합")
             out_path = core.output_dataset_path(out_dir, f"{layer.name}_joined", fmt)
             ok, out_path, _log = core.join_code_table(
                 layer, mnum, start, length, code_csv, key_col, value_cols, out_path, fmt, in_enc, out_enc)

@@ -14,6 +14,7 @@ import re
 import shutil
 import struct
 import subprocess
+import threading
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,6 +77,116 @@ def _log(message: str) -> None:
             pass
 
 
+# ────────────────────────────── 취소 / 진행률 ──────────────────────────────
+class Cancelled(RuntimeError):
+    """사용자가 [취소]를 눌렀을 때 발생합니다(작업 전체가 이 예외로 빠져나갑니다)."""
+
+
+class Canceller:
+    """실행 중인 GDAL 프로세스를 밖에서 멈추기 위한 스위치.
+
+    무거운 작업은 전부 `ogr2ogr.exe` 프로세스가 하므로, 취소 = 그 프로세스를 죽이는 것입니다.
+    죽인 뒤 `run_cmd`가 `Cancelled`를 올리면 호출 스택이 통째로 풀리면서
+    임시폴더 정리(`with tempfile...`)까지 자동으로 됩니다.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+        self._flag = False
+
+    def reset(self) -> None:
+        with self._lock:
+            self._proc = None
+            self._flag = False
+
+    def attach(self, proc: subprocess.Popen | None) -> None:
+        with self._lock:
+            self._proc = proc
+            flagged = self._flag
+        if flagged and proc is not None:      # 이미 취소를 눌러둔 상태였다면 바로 종료
+            self._kill(proc)
+
+    @staticmethod
+    def _kill(proc: subprocess.Popen) -> None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._flag = True
+            proc = self._proc
+        if proc is not None:
+            self._kill(proc)
+
+    @property
+    def cancelled(self) -> bool:
+        with self._lock:
+            return self._flag
+
+
+class ProgressReporter:
+    """GDAL이 뱉는 진행률(`-progress`)을 화면 진행률로 옮깁니다.
+
+    한 작업은 GDAL 명령 여러 번으로 이루어집니다(예: 안전 변환 = 도형복구 + 재투영).
+    작업 시작 때 `begin(총 명령 수)`를 부르면, 명령마다 그 구간을 나눠 씁니다.
+    예상보다 명령이 많아지면 총 수를 자동으로 늘려서 막대가 뒤로 가지 않게 합니다.
+    """
+
+    def __init__(self) -> None:
+        self.callback: Callable[[float, str, int, int], None] | None = None
+        self.total = 1
+        self.step = 0
+        self.label = ""
+
+    def bind(self, callback: Callable[[float, str, int, int], None] | None) -> None:
+        self.callback = callback
+
+    def begin(self, total_steps: int, label: str = "") -> None:
+        self.total = max(1, int(total_steps))
+        self.step = 0
+        self.label = label
+        self._emit(0.0)
+
+    def next_step(self) -> None:
+        self.step += 1
+        if self.step > self.total:
+            self.total = self.step
+        self._emit(0.0)
+
+    def tick(self, percent_of_step: float) -> None:
+        self._emit(percent_of_step)
+
+    def finish(self) -> None:
+        if self.callback:
+            try:
+                self.callback(100.0, self.label, self.step, self.total)
+            except Exception:
+                pass
+
+    def _emit(self, percent_of_step: float) -> None:
+        if not self.callback:
+            return
+        done = max(0, self.step - 1)
+        pct = min(max(percent_of_step, 0.0), 100.0)
+        overall = (done + pct / 100.0) / self.total * 100.0
+        try:
+            self.callback(min(99.0, overall), self.label, max(self.step, 1), self.total)
+        except Exception:
+            pass
+
+
+CANCEL = Canceller()
+PROGRESS = ProgressReporter()
+
+# `-progress`가 찍는 진행 표시(`0...10...20... - done.`)를 로그에서 걷어내기 위한 패턴
+_PROGRESS_NOISE = re.compile(r"(?:\d{1,3}\s*\.\.\.\s*)+\d{0,3}(?:\s*-\s*done\.?)?")
+# 마지막으로 찍힌 진행률 숫자(뒤에 `...`나 `- done`이 오는 것만 진행률로 인정)
+_PROGRESS_NUM = re.compile(r"(\d{1,3})(?=\s*\.\.\.|\s*-\s*done)")
+
+
 # ────────────────────────────── 문자열/식별자 ──────────────────────────────
 def safe_name(value: object, fallback: str = "value") -> str:
     text = str(value).strip() if value is not None else ""
@@ -116,6 +227,73 @@ def _exe_in_bin(bin_dir: Path, name: str) -> str | None:
     return None
 
 
+def _registry_qgis_bins() -> list[Path]:
+    """설치 정보(레지스트리)에서 QGIS/OSGeo4W 설치 폴더를 찾습니다.
+
+    QGIS를 D드라이브 등 기본 위치가 아닌 곳에 깔아도 여기서 잡힙니다.
+    """
+    if os.name != "nt":
+        return []
+    try:
+        import winreg
+    except Exception:
+        return []
+    found: list[Path] = []
+    roots = [(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+             (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")]
+    for hive, sub in roots:
+        try:
+            with winreg.OpenKey(hive, sub) as key:
+                for index in range(winreg.QueryInfoKey(key)[0]):
+                    try:
+                        name = winreg.EnumKey(key, index)
+                        if not any(tag in name.upper() for tag in ("QGIS", "OSGEO")):
+                            continue
+                        with winreg.OpenKey(key, name) as item:
+                            for value_name in ("InstallLocation", "InstallDir", "UninstallString"):
+                                try:
+                                    raw = str(winreg.QueryValueEx(item, value_name)[0]).strip('" ')
+                                except OSError:
+                                    continue
+                                base = _normalize_bin_path(raw)
+                                if base and (base / "bin").is_dir():
+                                    found.append(base / "bin")
+                                elif base and base.name.lower() == "bin":
+                                    found.append(base)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return found
+
+
+def _drive_scan_bins() -> list[Path]:
+    """모든 고정 드라이브 루트에서 `QGIS*` / `OSGeo4W*` 폴더를 찾습니다(한 겹만 훑습니다)."""
+    if os.name != "nt":
+        return []
+    found: list[Path] = []
+    for letter in "CDEFGH":
+        root = Path(f"{letter}:\\")
+        if not root.exists():
+            continue
+        for parent in (root, root / "Program Files", root / "Program Files (x86)"):
+            if not parent.is_dir():
+                continue
+            try:
+                for child in parent.iterdir():
+                    if not child.is_dir():
+                        continue
+                    upper = child.name.upper()
+                    if upper.startswith("QGIS") or upper.startswith("OSGEO4W"):
+                        bin_dir = child / "bin"
+                        if bin_dir.is_dir():
+                            found.append(bin_dir)
+            except OSError:
+                continue
+    return sorted(set(found), reverse=True)
+
+
 def _gdal_bin_candidates(manual_bin: str | None = None) -> list[Path]:
     candidates: list[Path] = []
 
@@ -148,6 +326,9 @@ def _gdal_bin_candidates(manual_bin: str | None = None) -> list[Path]:
         path = _normalize_bin_path(path_text)
         if path:
             candidates.append(path)
+
+    candidates.extend(_registry_qgis_bins())
+    candidates.extend(_drive_scan_bins())
 
     unique: list[Path] = []
     seen: set[str] = set()
@@ -188,25 +369,64 @@ def _gdal_env(exe_path: str | None) -> dict[str, str]:
 
 
 def run_cmd(args: list[str]) -> tuple[bool, str]:
-    _log("$ " + " ".join(f'"{a}"' if " " in str(a) else str(a) for a in args[:1] + args[1:]))
+    """GDAL 명령을 실행합니다.
+
+    출력을 한 번에 받지 않고 **흘러나오는 대로 읽습니다.** ogr2ogr에 `-progress`를 붙이면
+    `0...10...20...` 을 실시간으로 뱉는데, 그걸 그대로 화면 진행률로 씁니다(실측 확인).
+    같은 이유로 실행 중인 프로세스를 붙잡고 있으므로 [취소]로 즉시 끊을 수 있습니다.
+    """
+    is_ogr2ogr = Path(args[0]).stem.lower() == "ogr2ogr" if args else False
+    if is_ogr2ogr and "-progress" not in args:
+        args = [args[0], "-progress"] + list(args[1:])
+    _log("$ " + " ".join(f'"{a}"' if " " in str(a) else str(a) for a in args))
+
+    if CANCEL.cancelled:
+        raise Cancelled("사용자가 작업을 취소했습니다.")
+    if is_ogr2ogr:
+        PROGRESS.next_step()
+
     try:
-        completed = subprocess.run(
+        proc = subprocess.Popen(
             args,
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
             env=_gdal_env(args[0] if args else None),
             creationflags=_NO_WINDOW,
         )
     except FileNotFoundError as exc:
         _log(f"[실패] {exc}")
         return False, str(exc)
-    output = "\n".join(part for part in [completed.stdout, completed.stderr] if part).strip()
+
+    CANCEL.attach(proc)
+    chunks: list[bytes] = []
+    tail = ""
+    try:
+        fd = proc.stdout.fileno() if proc.stdout else None
+        while fd is not None:
+            data = os.read(fd, 4096)     # 있는 만큼 바로 읽습니다(끝까지 안 기다림)
+            if not data:
+                break
+            chunks.append(data)
+            if is_ogr2ogr:
+                tail = (tail + data.decode("utf-8", "replace"))[-64:]
+                found = _PROGRESS_NUM.findall(tail)
+                if found:
+                    PROGRESS.tick(max(int(v) for v in found))
+        proc.wait()
+    finally:
+        CANCEL.attach(None)
+        if proc.stdout:
+            proc.stdout.close()
+
+    if CANCEL.cancelled:
+        raise Cancelled("사용자가 작업을 취소했습니다.")
+
+    output = b"".join(chunks).decode("utf-8", "replace")
+    output = _PROGRESS_NOISE.sub("", output).strip()   # 로그에는 진행 표시를 남기지 않습니다
     if output:
         _log(output)
-    return completed.returncode == 0, output
+    return proc.returncode == 0, output
 
 
 # ────────────────────────────── 레이어 탐색 ──────────────────────────────
