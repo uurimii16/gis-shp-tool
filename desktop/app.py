@@ -35,7 +35,7 @@ except Exception:  # 라이브러리 미설치 등
     HAS_DND = False
 
 APP_TITLE = "SHP 좌표변환·병합·분할 도구 (데스크톱)"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 QGIS_URL = "https://qgis.org/download/"
 
 # ----- 밝은 테마 색상 -----
@@ -215,6 +215,68 @@ class ShpToolApp(BASE_TK):
         except Exception:
             pass
 
+    @staticmethod
+    def _indicator_image(size: int, fill: str, border: str, mark: str | None) -> tk.PhotoImage:
+        """체크박스 네모칸 그림 하나를 픽셀 단위로 그려서 돌려줍니다."""
+        rows = [[fill] * size for _ in range(size)]
+        edge = max(1, size // 8)                       # 테두리 두께
+        for y in range(size):
+            for x in range(size):
+                if x < edge or y < edge or x >= size - edge or y >= size - edge:
+                    rows[y][x] = border
+        if mark:
+            # ✓ 모양: (짧은 아래획) → (긴 위획). 굵기는 크기에 비례.
+            thick = max(2, size // 7)
+            segments = [((0.28, 0.52), (0.44, 0.70)), ((0.44, 0.70), (0.75, 0.30))]
+            for (x0, y0), (x1, y1) in segments:
+                steps = size * 2
+                for step in range(steps + 1):
+                    t = step / steps
+                    px = round((x0 + (x1 - x0) * t) * size)
+                    py = round((y0 + (y1 - y0) * t) * size)
+                    for dx in range(thick):
+                        for dy in range(thick):
+                            mx, my = px + dx, py + dy
+                            if 0 <= mx < size and 0 <= my < size:
+                                rows[my][mx] = mark
+        image = tk.PhotoImage(width=size, height=size)
+        image.put(" ".join("{" + " ".join(row) + "}" for row in rows))
+        return image
+
+    def _apply_check_indicator(self, style: ttk.Style) -> None:
+        """체크박스의 체크 표시를 직접 그린 ✓로 바꿉니다.
+
+        clam 테마는 켜진 체크박스를 **✓가 아니라 X(☒)로** 그립니다. 사용자가 "선택이 안 된
+        줄 알았다"고 할 만큼 헷갈리는 모양이라, 네모칸과 체크표시를 이미지로 만들어
+        indicator 요소를 교체합니다(웹판이 CSS로 직접 그리는 것과 같은 이유·같은 모양).
+        실패하면 조용히 기본 모양으로 남겨 둡니다.
+        """
+        try:
+            size = 16
+            self._check_images = {
+                "off": self._indicator_image(size, "#ffffff", "#98a2b3", None),
+                "on": self._indicator_image(size, ACCENT_D, ACCENT_D, "#ffffff"),
+                "off_disabled": self._indicator_image(size, "#f1f4f7", "#c8d2dc", None),
+                "on_disabled": self._indicator_image(size, "#b9c6d2", "#b9c6d2", "#ffffff"),
+            }
+            style.element_create(
+                "Check.indicator", "image", self._check_images["off"],
+                ("disabled", "selected", self._check_images["on_disabled"]),
+                ("disabled", self._check_images["off_disabled"]),
+                ("selected", self._check_images["on"]),
+                border=0, sticky="", padding=(0, 0, 6, 0),
+            )
+            style.layout("TCheckbutton", [
+                ("Checkbutton.padding", {"sticky": "nswe", "children": [
+                    ("Check.indicator", {"side": "left", "sticky": ""}),
+                    ("Checkbutton.focus", {"side": "left", "sticky": "w", "children": [
+                        ("Checkbutton.label", {"sticky": "nswe"}),
+                    ]}),
+                ]}),
+            ])
+        except tk.TclError:
+            pass
+
     def _build_style(self) -> None:
         style = ttk.Style(self)
         try:
@@ -231,6 +293,7 @@ class ShpToolApp(BASE_TK):
         style.configure("Head.TLabel", background=CARD, foreground=INK, font=(UI_FONT, 11, "bold"))
         style.configure("TCheckbutton", background=CARD, foreground=INK, font=base)
         style.configure("TRadiobutton", background=CARD, foreground=INK, font=base)
+        self._apply_check_indicator(style)
         style.configure("TButton", font=base, padding=(10, 5))
         style.configure("Accent.TButton", font=(UI_FONT, 10, "bold"), padding=(12, 6),
                         background=ACCENT, foreground="#ffffff")

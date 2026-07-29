@@ -1,8 +1,8 @@
 # PyInstaller용 파일 정보(윈도우 '속성 > 자세히'에 표시됩니다).
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 0, 0),
-    prodvers=(1, 0, 0, 0),
+    filevers=(1, 1, 0, 0),
+    prodvers=(1, 1, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,11 +16,11 @@ VSVersionInfo(
         '041204B0',
         [StringStruct('CompanyName', 'uurimii'),
          StringStruct('FileDescription', 'SHP 좌표변환·병합·분할 도구'),
-         StringStruct('FileVersion', '1.0.0'),
+         StringStruct('FileVersion', '1.1.0'),
          StringStruct('InternalName', 'SHP도구'),
          StringStruct('OriginalFilename', 'SHP도구.exe'),
          StringStruct('ProductName', 'SHP 좌표변환·병합·분할 도구'),
-         StringStruct('ProductVersion', '1.0.0')])
+         StringStruct('ProductVersion', '1.1.0')])
     ]),
     VarFileInfo([VarStruct('Translation', [1042, 1200])])
   ]

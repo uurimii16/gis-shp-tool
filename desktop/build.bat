@@ -4,11 +4,11 @@ REM ── SHP 도구 데스크톱 exe 빌드 + 사원 배포용 zip 만들기 �
 REM 사용법: 이 폴더에서 build.bat 더블클릭
 REM 결과:
 REM   dist\SHP도구.exe              ← 프로그램 본체
-REM   dist\SHP도구_배포_v1.0.0.zip  ← 사원에게 전달할 파일(exe + 사용설명서)
+REM   dist\SHP도구_배포_v1.1.0.zip  ← 사원에게 전달할 파일(exe + 사용설명서)
 
 cd /d "%~dp0"
 set APPNAME=SHP도구
-set VER=1.0.0
+set VER=1.1.0
 
 echo [1/5] 빌드 도구 확인/설치
 python -m pip install --quiet --upgrade pyinstaller tkinterdnd2 pillow
