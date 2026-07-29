@@ -35,7 +35,7 @@ except Exception:  # 라이브러리 미설치 등
     HAS_DND = False
 
 APP_TITLE = "SHP 좌표변환·병합·분할 도구 (데스크톱)"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 QGIS_URL = "https://qgis.org/download/"
 
 # ----- 밝은 테마 색상 -----
@@ -335,7 +335,7 @@ class ShpToolApp(BASE_TK):
 
         self.drop_zone = tk.Label(
             files_card,
-            text=("📂  여기로 파일을 끌어다 놓으세요   ·   .shp / .gpkg / .zip / 폴더"
+            text=("📂  여기로 파일을 끌어다 놓으세요   ·   .shp / .gpkg / .zip / 폴더 / 코드표 .csv"
                   if HAS_DND else "아래 [파일 선택] 또는 [폴더 선택] 버튼을 눌러 주세요"),
             bg=DROP_BG, fg=ACCENT_D, font=(UI_FONT, 10, "bold"),
             relief="ridge", bd=1, padx=10, pady=9, cursor="hand2")
@@ -737,8 +737,18 @@ class ShpToolApp(BASE_TK):
         self.join_code_label = ttk.Label(tab, text="추출된 코드 예시: -", style="Muted.TLabel")
         self.join_code_label.pack(anchor="w")
 
+        # 코드표 CSV도 끌어다 놓을 수 있게(버튼으로 고르는 방법도 그대로 둡니다)
+        self.csv_drop = tk.Label(
+            tab,
+            text=("📄  코드표 CSV를 여기로 끌어다 놓으세요   ·   버튼으로 골라도 됩니다"
+                  if HAS_DND else "아래 [코드표 CSV 선택] 버튼을 눌러 주세요"),
+            bg=DROP_BG, fg=MUTED, font=(UI_FONT, 10), pady=10, relief="flat",
+        )
+        self.csv_drop.pack(fill="x", pady=(8, 0))
+        self._register_drop_csv(self.csv_drop)
+
         row2 = ttk.Frame(tab, style="Card.TFrame")
-        row2.pack(fill="x", pady=(8, 4))
+        row2.pack(fill="x", pady=(6, 4))
         ttk.Button(row2, text="코드표 CSV 선택", command=self.pick_code_csv).pack(side="left")
         self.join_csv_label = ttk.Label(row2, text="선택된 코드표 없음", style="Card.TLabel")
         self.join_csv_label.pack(side="left", padx=10)
@@ -844,21 +854,62 @@ class ShpToolApp(BASE_TK):
 
     def _on_drag_leave(self, _event) -> None:
         self.drop_zone.configure(bg=DROP_BG,
-                                 text="📂  여기로 파일을 끌어다 놓으세요   ·   .shp / .gpkg / .zip / 폴더")
+                                 text="📂  여기로 파일을 끌어다 놓으세요   ·   .shp / .gpkg / .zip / 폴더 / 코드표 .csv")
 
-    def _on_drop(self, event) -> None:
-        self._on_drag_leave(event)
+    def _paths_from_event(self, event) -> list[Path]:
+        """끌어놓기 이벤트에서 실제 경로만 뽑아냅니다(공백 있는 경로도 안전하게)."""
         try:
-            items = self.tk.splitlist(event.data)  # 공백 있는 경로도 안전하게 분리
+            items = self.tk.splitlist(event.data)
         except Exception:
             items = [part for part in str(event.data).split() if part]
         paths = [Path(item.strip("{}")) for item in items if str(item).strip()]
-        paths = [path for path in paths if path.exists()]
+        return [path for path in paths if path.exists()]
+
+    def _on_drop(self, event) -> None:
+        self._on_drag_leave(event)
+        paths = self._paths_from_event(event)
         if not paths:
             self.log("끌어놓은 항목에서 파일을 찾지 못했습니다.")
             return
-        self.log(f"끌어놓기: {len(paths)}개 항목")
-        self.add_paths(paths)
+        # CSV는 지도 레이어가 아니라 '코드표'이므로 큰 상자에 놓아도 코드 결합 탭으로 보냅니다.
+        csvs = [path for path in paths if path.suffix.lower() == ".csv"]
+        others = [path for path in paths if path.suffix.lower() != ".csv"]
+        if csvs:
+            self.log(f"끌어놓기: 코드표 CSV로 인식 — {csvs[0].name}"
+                     + (f" (CSV {len(csvs)}개 중 첫 번째)" if len(csvs) > 1 else ""))
+            self.load_code_csv(csvs[0])
+        if others:
+            self.log(f"끌어놓기: {len(others)}개 항목")
+            self.add_paths(others)
+
+    # ── 코드표 CSV 전용 드롭 영역(코드 결합 탭) ──────────────────────────
+    def _register_drop_csv(self, widget: tk.Misc) -> None:
+        if not HAS_DND:
+            return
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self._on_drop_csv)
+            widget.dnd_bind("<<DragEnter>>", lambda _e: self.csv_drop.configure(
+                bg=DROP_HOVER, text="📥  놓으면 코드표로 읽습니다"))
+            widget.dnd_bind("<<DragLeave>>", lambda _e: self._reset_csv_drop())
+        except Exception:
+            pass
+
+    def _reset_csv_drop(self, filename: str | None = None) -> None:
+        if filename:
+            self.csv_drop.configure(bg=DROP_BG, text=f"📄  코드표: {filename}   ·   다른 파일을 놓으면 바뀝니다")
+        else:
+            self.csv_drop.configure(
+                bg=DROP_BG, text="📄  코드표 CSV를 여기로 끌어다 놓으세요   ·   버튼으로 골라도 됩니다")
+
+    def _on_drop_csv(self, event) -> None:
+        self._reset_csv_drop()
+        paths = self._paths_from_event(event)
+        csvs = [path for path in paths if path.suffix.lower() in (".csv", ".txt")]
+        if not csvs:
+            self.log("여기에는 코드표 CSV를 놓아 주세요(.csv). 지도 파일은 위쪽 큰 상자에 놓으면 됩니다.")
+            return
+        self.load_code_csv(csvs[0])
 
     def log(self, message: str) -> None:
         self.log_queue.put(message)
@@ -1409,15 +1460,24 @@ class ShpToolApp(BASE_TK):
 
     def pick_code_csv(self) -> None:
         path = filedialog.askopenfilename(title="코드표 CSV 선택", filetypes=[("CSV", "*.csv"), ("모든 파일", "*.*")])
-        if not path:
+        if path:
+            self.load_code_csv(Path(path))
+
+    def load_code_csv(self, path: Path) -> None:
+        """코드표 CSV를 읽어 인코딩을 자동 판정합니다(버튼 선택·끌어놓기 공용)."""
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            messagebox.showerror("코드표 읽기 실패", f"{path.name}\n\n{exc}")
             return
-        self.code_csv_path = Path(path)
-        self.code_raw = self.code_csv_path.read_bytes()
+        self.code_csv_path = path
+        self.code_raw = raw
         report = core.csv_encoding_report(self.code_raw)
         for row in report:
             self.log(f"[코드표 인코딩] {row['인코딩']}: 깨짐 점수 {row['깨짐 의심 점수']} · {row['컬럼']}")
         self.join_csv_enc.set(core.best_encoding(report, core.CSV_ENCODINGS))
-        self.join_csv_label.configure(text=self.code_csv_path.name)
+        self.join_csv_label.configure(text=path.name)
+        self._reset_csv_drop(path.name)
         self._reload_code_table()
 
     def _reload_code_table(self) -> None:
