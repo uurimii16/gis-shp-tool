@@ -35,7 +35,7 @@ except Exception:  # 라이브러리 미설치 등
     HAS_DND = False
 
 APP_TITLE = "SHP 좌표변환·병합·분할 도구 (데스크톱)"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 QGIS_URL = "https://qgis.org/download/"
 
 # ----- 밝은 테마 색상 -----
@@ -769,7 +769,7 @@ class ShpToolApp(BASE_TK):
         self.join_format = tk.StringVar(value="GPKG")
         ttk.Radiobutton(row3, text="SHP", value="SHP", variable=self.join_format).pack(side="left", padx=4)
         ttk.Radiobutton(row3, text="GPKG", value="GPKG", variable=self.join_format).pack(side="left", padx=4)
-        ttk.Label(row3, text="(SHP은 필드명이 10바이트로 잘립니다 — 한글 컬럼이면 GPKG 권장)",
+        ttk.Label(row3, text="(SHP은 필드명 10바이트 제한 — 한글 컬럼명은 GPKG, 또는 SHP+출력인코딩 CP949)",
                   style="Muted.TLabel").pack(side="left", padx=8)
 
         body = ttk.Frame(tab, style="Card.TFrame")
@@ -1517,8 +1517,12 @@ class ShpToolApp(BASE_TK):
         matched = [key for key in keys if key in codeset]
         rate = len(matched) / len(keys) * 100
         unmatched = list(dict.fromkeys([key for key in keys if key not in codeset]))[:8]
-        self.log(f"매칭률(앞 {len(keys)}행): {rate:.0f}% ({len(matched)}/{len(keys)})"
+        # 표본인지 전체인지 분명히 밝힙니다(DBF 앞 500행까지만 읽습니다).
+        scope = f"앞 {len(keys)}행 표본" if len(keys) >= 500 else f"전체 {len(keys)}행"
+        self.log(f"매칭률({scope}): {rate:.0f}% ({len(matched)}/{len(keys)})"
                  + (f" · 미매칭 예시: {', '.join(unmatched)}" if unmatched else ""))
+        if len(keys) >= 500:
+            self.log("   ※ 앞부분만 본 값입니다. 실행 후 로그의 '실제 결합률'로 전체를 확인하세요.")
         if rate == 0:
             messagebox.showwarning("매칭 0%", "substr 시작 위치·길이 또는 코드표 키 컬럼을 다시 확인하세요.")
 
@@ -1551,6 +1555,26 @@ class ShpToolApp(BASE_TK):
                 self.log("❌ 코드 결합 실패 — 로그를 확인하세요.")
                 return
             self.log(f"✅ {out_path.name} | 붙인 컬럼: {', '.join(value_cols)}")
+
+            # 결과를 직접 세어 확인합니다(실행 전 매칭률은 앞 500행 표본이라 전체를 보장 못 함).
+            source_fields = set(core.columns_for_layer(layer, in_enc))
+            result_fields = core.layer_field_names(out_path)
+            new_fields = [f for f in result_fields if f not in source_fields]
+            if new_fields:
+                self.log(f"   결과 컬럼명: {', '.join(new_fields)}")
+                truncated = [f for f, want in zip(new_fields, value_cols) if f != want]
+                if truncated and fmt == "SHP":
+                    self.log("   ⚠️ SHP은 필드명이 10바이트로 잘립니다. 한글 컬럼명을 온전히 두려면 "
+                             "SHP 출력 인코딩을 CP949로 하거나 저장 형식을 GPKG로 하세요.")
+                report = core.join_fill_report(out_path, new_fields[0], mnum, start, length)
+                if report:
+                    total, filled, empty = report["total"], report["filled"], report["empty"]
+                    rate = (filled / total * 100) if total else 0
+                    self.log(f"   실제 결합률: {filled:,}/{total:,} ({rate:.1f}%) · 값이 빈 행 {empty:,}건")
+                    if empty:
+                        samples = ", ".join(report.get("samples") or []) or "-"
+                        self.log(f"   ⚠️ 코드표에 없는 코드 예시: {samples}")
+                        self.log("      → substr 시작/길이, 코드표 키 컬럼, 코드표에 그 코드가 있는지 확인하세요.")
             self.finish(out_dir, "코드 결합 완료")
 
         self.run_task("코드 결합", job)

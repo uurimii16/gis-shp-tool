@@ -781,6 +781,43 @@ def write_csv_utf8(table: Table, out_path: Path) -> None:
             writer.writerow({col: row.get(col, "") for col in table.columns})
 
 
+def _first_int_values(text: str) -> list[int]:
+    """ogrinfo 출력에서 `이름 (Integer) = 12` 형태의 숫자만 순서대로 뽑습니다."""
+    return [int(m) for m in re.findall(r"\(Integer(?:64)?\)\s*=\s*(-?\d+)", text)]
+
+
+def join_fill_report(path: Path, value_field: str, key_field: str,
+                     start: int, length: int) -> dict[str, object]:
+    """코드 결합 **결과 파일**에서 값이 실제로 붙은 비율을 셉니다.
+
+    실행 전 '매칭률'은 DBF 앞부분(500행) 표본이라 전체를 보장하지 못합니다.
+    LEFT JOIN이라 못 붙은 행은 조용히 빈칸이 되므로, 끝난 뒤 결과를 직접 세어
+    "몇 건 중 몇 건이 비었는지"를 알려 줍니다.
+    """
+    _, ogrinfo = gdals()
+    if not ogrinfo or not path.exists():
+        return {}
+    layer_name, _ = resolve_layer_and_geom(path)
+    empty_cond = f'"{value_field}" IS NULL OR TRIM("{value_field}") = \'\''
+    ok, out = run_cmd([
+        ogrinfo, "-dialect", "SQLite", "-sql",
+        f'SELECT COUNT(*) AS n_total, SUM(CASE WHEN {empty_cond} THEN 1 ELSE 0 END) AS n_empty '
+        f'FROM "{layer_name}"', str(path)])
+    numbers = _first_int_values(out) if ok else []
+    if len(numbers) < 2:
+        return {}
+    total, empty = numbers[0], numbers[1]
+    samples: list[str] = []
+    if empty and key_field:
+        ok2, out2 = run_cmd([
+            ogrinfo, "-dialect", "SQLite", "-sql",
+            f'SELECT DISTINCT TRIM(substr("{key_field}", {int(start)}, {int(length)})) AS code '
+            f'FROM "{layer_name}" WHERE {empty_cond} LIMIT 5', str(path)])
+        if ok2:
+            samples = [m.strip() for m in re.findall(r"code \(String\)\s*=\s*(.*)", out2) if m.strip()]
+    return {"total": total, "empty": empty, "filled": total - empty, "samples": samples}
+
+
 def substr_key(value: object, start: int, length: int) -> str:
     """SQLite substr(x, start, length)와 동일한 규칙(1-기준)으로 코드 추출."""
     begin = max(int(start) - 1, 0)
