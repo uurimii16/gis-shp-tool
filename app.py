@@ -1284,8 +1284,17 @@ def join_code_table(
 APP_CSS = """
 <style>
 /* ── 체크박스: 브라우저·테마·Streamlit 버전에 따라 체크 모양이 X나 빈칸으로 보이는 일이
-   없도록, 네모칸과 체크표시를 앱이 직접 그립니다(글꼴·SVG에 의존하지 않음). ── */
-[data-testid="stCheckbox"] label > span:first-child {
+   없도록, 네모칸과 체크표시를 앱이 직접 그립니다(글꼴·SVG에 의존하지 않음).
+
+   주의: Streamlit 버전마다 네모칸의 DOM 위치가 다릅니다. 실측 결과 두 가지입니다.
+     (A) label > span(네모칸 본체) + input + div(라벨)         … 예: 로컬 1.58
+     (B) label > span(화면에서 감춘 input 감싸개) + div(네모칸) … 예: Streamlit Cloud
+   (B)의 span은 `clip-path: inset(50%)`로 감춰져 있어 여기에 색을 칠해도 안 보입니다.
+   그래서 두 경우를 모두 선택자로 잡습니다. (A)는 input을 자식으로 갖지 않는 첫 span,
+   (B)는 input을 감싼 span의 바로 다음 div입니다. ── */
+[data-testid="stCheckbox"] label > span:first-child:not(:has(> input)),
+[data-testid="stCheckbox"] label > span:has(> input) + div {
+    box-sizing: border-box !important;
     position: relative !important;
     width: 20px !important;
     height: 20px !important;
@@ -1297,19 +1306,25 @@ APP_CSS = """
     background-image: none !important;
     box-shadow: none !important;
 }
-[data-testid="stCheckbox"] label > span:first-child > * {
-    display: none !important;   /* 기본 체크 아이콘(SVG/아이콘폰트) 제거 */
+/* 기본 체크 아이콘(SVG/아이콘폰트) 제거 */
+[data-testid="stCheckbox"] label > span:first-child:not(:has(> input)) > *,
+[data-testid="stCheckbox"] label > span:has(> input) + div > * {
+    display: none !important;
 }
-[data-testid="stCheckbox"] label:hover > span:first-child {
+[data-testid="stCheckbox"] label:hover > span:first-child:not(:has(> input)),
+[data-testid="stCheckbox"] label:hover > span:has(> input) + div {
     border-color: #1769e0 !important;
 }
-[data-testid="stCheckbox"] label:has(input:checked) > span:first-child {
+[data-testid="stCheckbox"] label:has(input:checked) > span:first-child:not(:has(> input)),
+[data-testid="stCheckbox"] label:has(input:checked) > span:has(> input) + div {
     background-color: #1769e0 !important;
     border-color: #1769e0 !important;
 }
-[data-testid="stCheckbox"] label:has(input:checked) > span:first-child::after {
+[data-testid="stCheckbox"] label:has(input:checked) > span:first-child:not(:has(> input))::after,
+[data-testid="stCheckbox"] label:has(input:checked) > span:has(> input) + div::after {
     content: "" !important;
-    position: absolute;
+    position: absolute !important;
+    display: block !important;
     left: 5.5px;
     top: 1.5px;
     width: 5px;
@@ -1317,9 +1332,9 @@ APP_CSS = """
     border: solid #ffffff;
     border-width: 0 2.5px 2.5px 0;
     transform: rotate(45deg);
-    display: block !important;
 }
-[data-testid="stCheckbox"] label:has(input:disabled) > span:first-child {
+[data-testid="stCheckbox"] label:has(input:disabled) > span:first-child:not(:has(> input)),
+[data-testid="stCheckbox"] label:has(input:disabled) > span:has(> input) + div {
     opacity: 0.45 !important;
 }
 [data-testid="stCheckbox"] label { cursor: pointer; align-items: center !important; }
