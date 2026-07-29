@@ -8,6 +8,7 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import time
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -130,18 +131,25 @@ def _manual_gdal_bin() -> str | None:
         return None
 
 
-def gdals() -> tuple[str | None, str | None]:
+@st.cache_data(show_spinner=False, ttl=600)
+def _gdals_cached(manual_bin: str | None) -> tuple[str | None, str | None]:
+    """GDAL 실행 파일 탐색 결과(경로가 안 바뀌는 동안 재탐색하지 않도록 캐시)."""
     found_ogr2ogr = shutil.which("ogr2ogr")
     found_ogrinfo = shutil.which("ogrinfo")
     if found_ogr2ogr and found_ogrinfo:
         return found_ogr2ogr, found_ogrinfo
 
-    for bin_dir in _gdal_bin_candidates(_manual_gdal_bin()):
+    for bin_dir in _gdal_bin_candidates(manual_bin):
         ogr2ogr = _exe_in_bin(bin_dir, "ogr2ogr")
         ogrinfo = _exe_in_bin(bin_dir, "ogrinfo")
         if ogr2ogr and ogrinfo:
             return ogr2ogr, ogrinfo
     return found_ogr2ogr, found_ogrinfo
+
+
+def gdals() -> tuple[str | None, str | None]:
+    """(ogr2ogr, ogrinfo) 경로. 화면 조작마다 Program Files를 다시 뒤지지 않도록 캐시합니다."""
+    return _gdals_cached(_manual_gdal_bin())
 
 
 def _gdal_env(exe_path: str | None) -> dict[str, str]:
@@ -178,6 +186,31 @@ def run_cmd(args: list[str]) -> tuple[bool, str]:
     return completed.returncode == 0, output.strip()
 
 
+def file_token(path: Path) -> tuple[str, int, int]:
+    """캐시 무효화용 파일 지문 (경로, 수정시각, 크기).
+
+    파일이 바뀌면 값이 달라지므로, 이 토큰을 캐시 키에 넣으면
+    **같은 파일을 다시 조사하지 않으면서도** 새 결과 파일은 정확히 다시 읽습니다.
+    """
+    try:
+        stat = path.stat()
+        return (str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return (str(path), 0, 0)
+
+
+@st.cache_data(show_spinner=False, max_entries=512)
+def cached_probe(token: tuple[str, int, int], args: tuple[str, ...]) -> tuple[bool, str]:
+    """파일 조사용 ogrinfo 호출 결과 캐시.
+
+    ogrinfo는 한 번 실행에 0.1~0.3초가 걸리는데, Streamlit은 위젯을 하나 누를 때마다
+    스크립트 전체(4개 탭)를 다시 실행합니다. 캐시가 없으면 체크박스 한 번에
+    레이어 수 × 2~3회씩 프로세스가 새로 뜹니다. 파일이 그대로면 결과도 그대로이므로
+    파일 지문(token)을 키로 캐시합니다.
+    """
+    return run_cmd(list(args))
+
+
 def session_root() -> Path:
     if "workdir" not in st.session_state:
         RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
@@ -194,6 +227,32 @@ def reset_workspace() -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     st.session_state.workdir = str(RUNTIME_DIR / f"shp_tool_{uuid.uuid4().hex[:12]}")
     st.session_state.layers = []
+    for key in [key for key in st.session_state if str(key).startswith("result__")]:
+        del st.session_state[key]
+
+
+def sweep_old_workspaces(max_age_hours: float = 12.0) -> None:
+    """오래된 세션 작업 폴더를 지웁니다(세션당 한 번).
+
+    세션마다 `.runtime/shp_tool_*` 폴더를 새로 만드는데, 브라우저를 그냥 닫으면
+    폴더가 남습니다. 클라우드에서는 이게 쌓여 디스크를 먹으므로 시작할 때 한 번 청소합니다.
+    """
+    if st.session_state.get("swept"):
+        return
+    st.session_state.swept = True
+    if not RUNTIME_DIR.exists():
+        return
+    keep = st.session_state.get("workdir")
+    cutoff = max_age_hours * 3600
+    now = time.time()
+    for folder in RUNTIME_DIR.glob("shp_tool_*"):
+        if str(folder) == keep or not folder.is_dir():
+            continue
+        try:
+            if now - folder.stat().st_mtime > cutoff:
+                shutil.rmtree(folder, ignore_errors=True)
+        except OSError:
+            continue
 
 
 def save_uploads(files) -> tuple[Path, list[str]]:
@@ -236,7 +295,7 @@ def gpkg_layer_names(path: Path) -> list[str]:
     _, ogrinfo = gdals()
     if not ogrinfo or not path.exists():
         return []
-    ok, output = run_cmd([ogrinfo, str(path)])
+    ok, output = cached_probe(file_token(path), (ogrinfo, str(path)))
     if not ok:
         return []
     names: list[str] = []
@@ -329,6 +388,16 @@ def dbf_fields(dbf_path: Path) -> list[dict[str, object]]:
 
 
 def read_dbf_preview(dbf_path: Path, encoding: str, limit: int = 30) -> pd.DataFrame:
+    """DBF 앞부분을 표로 읽습니다(같은 파일·인코딩이면 캐시에서 바로 반환)."""
+    return _read_dbf_preview_cached(file_token(dbf_path), encoding, limit)
+
+
+@st.cache_data(show_spinner=False, max_entries=256)
+def _read_dbf_preview_cached(token: tuple[str, int, int], encoding: str, limit: int) -> pd.DataFrame:
+    return _read_dbf_preview_uncached(Path(token[0]), encoding, limit)
+
+
+def _read_dbf_preview_uncached(dbf_path: Path, encoding: str, limit: int = 30) -> pd.DataFrame:
     with dbf_path.open("rb") as fp:
         header = fp.read(32)
         if len(header) < 32:
@@ -517,7 +586,7 @@ def ogr_layer_stats(path: Path, input_encoding: str | None = None, sublayer: str
     args += [str(path)]
     if sublayer:
         args += [sublayer]
-    ok, output = run_cmd(args)
+    ok, output = cached_probe(file_token(path), tuple(args))
     if not ok:
         return {}
     counts = [int(value) for value in re.findall(r"Feature Count:\s*(\d+)", output)]
@@ -543,7 +612,7 @@ def layer_field_names(path: Path, layer: str | None = None) -> list[str]:
     _, ogrinfo = gdals()
     if not ogrinfo or not path.exists():
         return []
-    ok, output = run_cmd([ogrinfo, "-so", "-al", str(path)] + ([layer] if layer else []))
+    ok, output = cached_probe(file_token(path), tuple([ogrinfo, "-so", "-al", str(path)] + ([layer] if layer else [])))
     if not ok:
         return []
     return [m.group(1).strip() for m in (FIELD_LINE_RE.match(line) for line in output.splitlines()) if m]
@@ -558,7 +627,7 @@ def layer_epsg(path: Path, sublayer: str | None = None) -> str | None:
     _, ogrinfo = gdals()
     if not ogrinfo or not path.exists():
         return None
-    ok, output = run_cmd([ogrinfo, "-so", "-al", str(path)] + ([sublayer] if sublayer else []))
+    ok, output = cached_probe(file_token(path), tuple([ogrinfo, "-so", "-al", str(path)] + ([sublayer] if sublayer else [])))
     if not ok:
         return None
     codes = re.findall(r'(?:ID\["EPSG",\s*(\d+)\]|AUTHORITY\["EPSG",\s*"(\d+)"\])', output)
@@ -578,7 +647,7 @@ def layer_geom_family(path: Path, sublayer: str | None = None) -> str:
     _, ogrinfo = gdals()
     if not ogrinfo or not path.exists():
         return "기타"
-    ok, output = run_cmd([ogrinfo, "-so", "-al", str(path)] + ([sublayer] if sublayer else []))
+    ok, output = cached_probe(file_token(path), tuple([ogrinfo, "-so", "-al", str(path)] + ([sublayer] if sublayer else [])))
     if not ok:
         return "기타"
     match = re.search(r"^Geometry:\s*(.+)$", output, re.MULTILINE)
@@ -728,7 +797,7 @@ def resolve_layer_and_geom(path: Path) -> tuple[str, str]:
     geom = "geometry"
     _, ogrinfo = gdals()
     if ogrinfo:
-        ok, out = run_cmd([ogrinfo, "-so", str(path), layer])
+        ok, out = cached_probe(file_token(path), (ogrinfo, "-so", str(path), layer))
         if ok:
             m = re.search(r"Geometry Column\s*=\s*(\S+)", out)
             if m:
@@ -1212,6 +1281,176 @@ def join_code_table(
     return ok, actual, "\n".join(logs)
 
 
+APP_CSS = """
+<style>
+/* ── 체크박스: 브라우저·테마·Streamlit 버전에 따라 체크 모양이 X나 빈칸으로 보이는 일이
+   없도록, 네모칸과 체크표시를 앱이 직접 그립니다(글꼴·SVG에 의존하지 않음). ── */
+[data-testid="stCheckbox"] label > span:first-child {
+    position: relative !important;
+    width: 20px !important;
+    height: 20px !important;
+    min-width: 20px !important;
+    flex: 0 0 20px !important;
+    border-radius: 5px !important;
+    border: 2px solid #98a2b3 !important;
+    background-color: #ffffff !important;
+    background-image: none !important;
+    box-shadow: none !important;
+}
+[data-testid="stCheckbox"] label > span:first-child > * {
+    display: none !important;   /* 기본 체크 아이콘(SVG/아이콘폰트) 제거 */
+}
+[data-testid="stCheckbox"] label:hover > span:first-child {
+    border-color: #1769e0 !important;
+}
+[data-testid="stCheckbox"] label:has(input:checked) > span:first-child {
+    background-color: #1769e0 !important;
+    border-color: #1769e0 !important;
+}
+[data-testid="stCheckbox"] label:has(input:checked) > span:first-child::after {
+    content: "" !important;
+    position: absolute;
+    left: 5.5px;
+    top: 1.5px;
+    width: 5px;
+    height: 10px;
+    border: solid #ffffff;
+    border-width: 0 2.5px 2.5px 0;
+    transform: rotate(45deg);
+    display: block !important;
+}
+[data-testid="stCheckbox"] label:has(input:disabled) > span:first-child {
+    opacity: 0.45 !important;
+}
+[data-testid="stCheckbox"] label { cursor: pointer; align-items: center !important; }
+
+/* 라디오(저장 형식 등)도 선택 상태가 또렷하게 보이도록 조금 키웁니다. */
+[data-testid="stRadio"] label > div:first-child { transform: scale(1.15); }
+
+/* 레이어 선택 체크박스 목록: 항목 간격을 좁혀 한눈에 들어오게 */
+.layer-pick [data-testid="stCheckbox"] { margin-bottom: -0.35rem; }
+</style>
+"""
+
+
+def inject_css() -> None:
+    st.markdown(APP_CSS, unsafe_allow_html=True)
+
+
+def checkbox_picker(
+    label: str,
+    options: list[str],
+    key: str,
+    default: bool = True,
+    ncols: int = 3,
+    help_text: str | None = None,
+) -> list[str]:
+    """여러 항목을 **체크박스 목록**으로 고릅니다.
+
+    예전에는 `st.multiselect`를 썼는데, 고른 항목이 색칠된 칩으로만 바뀌고 지우기용 `×`가
+    붙어 있어 "선택된 게 맞나?"를 헷갈리게 했습니다. 체크박스는 켜짐/꺼짐이 그대로 보입니다.
+    목록이 바뀌면(새로 업로드) 기본값으로 초기화합니다.
+    """
+    if not options:
+        return []
+    sig_key = f"{key}__sig"
+    signature = tuple(options)
+    if st.session_state.get(sig_key) != signature:
+        st.session_state[sig_key] = signature
+        for idx in range(len(options)):
+            st.session_state[f"{key}__{idx}"] = default
+
+    st.markdown(f"**{label}**")
+    if help_text:
+        st.caption(help_text)
+    btn_all, btn_none, _ = st.columns([1, 1, 6])
+    if btn_all.button("전체 선택", key=f"{key}__all"):
+        for idx in range(len(options)):
+            st.session_state[f"{key}__{idx}"] = True
+    if btn_none.button("전체 해제", key=f"{key}__none"):
+        for idx in range(len(options)):
+            st.session_state[f"{key}__{idx}"] = False
+
+    chosen: list[str] = []
+    st.markdown('<div class="layer-pick">', unsafe_allow_html=True)
+    columns = st.columns(min(ncols, len(options)) or 1)
+    for idx, option in enumerate(options):
+        with columns[idx % len(columns)]:
+            if st.checkbox(option, key=f"{key}__{idx}"):
+                chosen.append(option)
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.caption(f"선택됨 {len(chosen)} / {len(options)}개")
+    return chosen
+
+
+# ── 실행 결과 보존 ────────────────────────────────────────────────────────────
+# Streamlit은 버튼을 누른 그 실행에서만 `if st.button(...)` 안이 True입니다. 결과를 그 안에서
+# 바로 그리면, 사용자가 '결과 다운로드'를 누르는 순간 다시 실행되면서 성공 메시지·통계표·
+# 로그가 통째로 사라집니다(작업이 실패한 것처럼 보임). 그래서 결과를 세션에 저장해 두고
+# 버튼 블록 밖에서 매번 다시 그립니다.
+
+def save_result(slot: str, payload: dict) -> None:
+    st.session_state[f"result__{slot}"] = payload
+
+
+def clear_result(slot: str) -> None:
+    st.session_state.pop(f"result__{slot}", None)
+
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def _result_bytes(tokens: tuple, paths: tuple[str, ...], zip_name: str | None) -> tuple[str, bytes]:
+    """다운로드 바이트를 캐시합니다(화면이 다시 그려질 때마다 zip을 새로 만들지 않도록)."""
+    files = [Path(p) for p in paths]
+    if zip_name:
+        return zip_name, zip_paths(files, zip_name)
+    return download_for_path(files[0])
+
+
+def render_result(slot: str) -> None:
+    """저장해 둔 실행 결과(메시지·표·다운로드·로그)를 다시 그립니다."""
+    payload = st.session_state.get(f"result__{slot}")
+    if not payload:
+        return
+    st.divider()
+    for text in payload.get("success", []):
+        st.success(text)
+    for text in payload.get("info", []):
+        st.info(text)
+    for text in payload.get("warning", []):
+        st.warning(text)
+    for text in payload.get("error", []):
+        st.error(text)
+    for text in payload.get("caption", []):
+        st.caption(text)
+    table = payload.get("table")
+    if table:
+        st.dataframe(pd.DataFrame(table), width="stretch", hide_index=True)
+
+    paths = [p for p in payload.get("paths", []) if Path(p).exists()]
+    if paths:
+        zip_name = payload.get("zip_name")
+        try:
+            filename, data = _result_bytes(tuple(file_token(Path(p)) for p in paths), tuple(paths), zip_name)
+            st.download_button(
+                payload.get("download_label", "결과 다운로드"),
+                data,
+                filename,
+                key=f"{slot}__dl",
+                type="primary",
+            )
+        except Exception as exc:  # 파일이 지워진 경우 등
+            st.warning(f"결과 파일을 읽지 못했습니다: {exc}")
+    elif payload.get("paths"):
+        st.warning("결과 파일이 사라졌습니다('작업 초기화'를 눌렀거나 세션이 정리된 경우). 다시 실행해 주세요.")
+
+    log = payload.get("log") or ""
+    if log:
+        render_log_problems(log)
+        with st.expander("처리 로그", expanded=bool(payload.get("log_expanded"))):
+            st.code(log)
+        st.download_button("작업 로그 다운로드", log, payload.get("log_name", "log.txt"), key=f"{slot}__log_dl")
+
+
 def render_log_problems(log: str) -> None:
     """로그 속 ERROR/Warning을 접힌 로그 밖으로 끌어내 보여줍니다.
 
@@ -1267,8 +1506,9 @@ def render_layer_status(layers: list[LayerInfo], encoding: str) -> None:
 def render_convert_tab(layers: list[LayerInfo], encoding: str, output_encoding: str) -> None:
     st.subheader("좌표계 변환")
     if not layers:
-        st.stop()
-    labels = st.multiselect("변환할 레이어", layer_options(layers), default=layer_options(layers))
+        st.info("왼쪽에서 파일을 올린 뒤 사용할 수 있습니다.")
+        return
+    labels = checkbox_picker("변환할 레이어", layer_options(layers), key="convert_pick")
     target_choice = st.selectbox("목표 좌표계", list(COMMON_EPSG.keys()), index=0)
     target_epsg = COMMON_EPSG[target_choice]
     if target_epsg == "custom":
@@ -1293,7 +1533,8 @@ def render_convert_tab(layers: list[LayerInfo], encoding: str, output_encoding: 
     if safe_mode and not source_override:
         st.caption("⚠️ 원본 .prj가 불안정하면 '원본 EPSG 강제 지정'에 실제 좌표계(예: 5174)를 넣어야 재투영 중 피처 손실을 막습니다.")
 
-    if st.button("좌표계 변환 실행", type="primary"):
+    if st.button("좌표계 변환 실행", type="primary", disabled=not labels):
+        clear_result("convert")
         chosen = selected_layers(labels, layers)
         out_dir = session_root() / "converted"
         if out_dir.exists():
@@ -1337,32 +1578,39 @@ def render_convert_tab(layers: list[LayerInfo], encoding: str, output_encoding: 
                 row["변환 전 범위"] = before.get("extent", "-")
                 row["변환 후 범위"] = after.get("extent", "-")
                 stats_rows.append(row)
+        payload: dict = {
+            "success": [], "info": [], "warning": [], "error": [], "caption": [],
+            "paths": [str(p) for p in results],
+            "zip_name": "converted.zip" if results else None,
+            "download_label": "결과 전체 다운로드(zip)",
+            "log": "\n\n".join(logs) or "로그 없음",
+            "log_name": "convert_log.txt",
+            "log_expanded": (not results) or dropped_any,
+        }
         if results:
-            st.success(f"{len(results)}개 레이어 변환 완료")
-            st.download_button("결과 전체 다운로드(zip)", zip_paths(results, "converted.zip"), "converted.zip")
+            payload["success"].append(f"{len(results)}개 레이어 변환 완료")
             if output_format == "SHP" and any(p.suffix.lower() == ".gpkg" for p in results):
-                st.warning("일부 레이어는 SHP 저장에 실패해 GPKG로 대체 저장했습니다(zip 안에 .gpkg로 들어있고, QGIS에서 동일하게 열립니다).")
+                payload["warning"].append("일부 레이어는 SHP 저장에 실패해 GPKG로 대체 저장했습니다(zip 안에 .gpkg로 들어있고, QGIS에서 동일하게 열립니다).")
             if dropped_any:
-                st.error(
+                payload["error"].append(
                     "⚠️ 변환 중 사라진 피처가 있습니다(손실 열 확인). 원인은 보통 (1) 원본 좌표계 오판 또는 (2) 불량 도형입니다. "
                     "'원본 EPSG 강제 지정'에 실제 좌표계를 넣거나, 안전 변환 모드가 이미 켜져 있는지 확인하세요."
                 )
             if stats_rows:
-                st.caption("변환 단계별 feature 개수 / extent 비교" + (" (복구후=①도형복구 직후, 재투영 없이)" if safe_mode else ""))
-                st.dataframe(pd.DataFrame(stats_rows), width="stretch", hide_index=True)
+                payload["caption"].append("변환 단계별 feature 개수 / extent 비교" + (" (복구후=①도형복구 직후, 재투영 없이)" if safe_mode else ""))
+                payload["table"] = stats_rows
         else:
-            st.error("변환 결과가 없습니다. 로그를 확인하세요.")
-        log_text = "\n\n".join(logs) or "로그 없음"
-        render_log_problems(log_text)
-        with st.expander("처리 로그", expanded=not results or dropped_any):
-            st.code(log_text)
-        st.download_button("작업 로그 다운로드", log_text, "convert_log.txt", key="convert_log_dl")
+            payload["error"].append("변환 결과가 없습니다. 로그를 확인하세요.")
+        save_result("convert", payload)
+
+    render_result("convert")
 
 
 def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: str) -> None:
     st.subheader("레이어 병합")
     if not layers:
-        st.stop()
+        st.info("왼쪽에서 파일을 올린 뒤 사용할 수 있습니다.")
+        return
     mode = st.radio(
         "병합 방식",
         ["한 SHP 내 컬럼값 기준 병합(도형도 합침)", "속성만 합치기(도형·개수 유지)", "여러 레이어 병합"],
@@ -1412,6 +1660,7 @@ def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
                 st.caption("집계할 다른 속성 컬럼이 없습니다.")
 
         if st.button("내부 컬럼값 기준 병합 실행", type="primary"):
+            clear_result("merge_dissolve")
             if out_dir.exists():
                 shutil.rmtree(out_dir)
             out_dir.mkdir(parents=True)
@@ -1420,17 +1669,22 @@ def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
             if ok and add_area:
                 area_ok, out_path, area_log = add_area_column(out_path, output_format, output_encoding, int(area_decimals))
                 log = f"{log}\n[면적] {'area_m2 추가 완료' if area_ok else area_log}"
+            payload: dict = {
+                "success": [], "warning": [], "error": [],
+                "paths": [str(out_path)] if ok else [],
+                "log": log or "로그 없음",
+                "log_name": "merge_dissolve_log.txt",
+                "log_expanded": not ok,
+            }
             if ok:
-                st.success("병합 완료")
+                payload["success"].append("병합 완료")
                 if out_path.suffix.lower() == ".gpkg" and output_format == "SHP":
-                    st.warning("SHP 저장에 실패해 GPKG로 대체 저장했습니다(QGIS에서 동일하게 열립니다).")
-                filename, data = download_for_path(out_path)
-                st.download_button("결과 다운로드", data, filename)
+                    payload["warning"].append("SHP 저장에 실패해 GPKG로 대체 저장했습니다(QGIS에서 동일하게 열립니다).")
             else:
-                st.error("병합 실패")
-            render_log_problems(log or "")
-            st.code(log or "로그 없음")
-            st.download_button("작업 로그 다운로드", log or "로그 없음", "merge_dissolve_log.txt", key="merge_one_log_dl")
+                payload["error"].append("병합 실패")
+            save_result("merge_dissolve", payload)
+
+        render_result("merge_dissolve")
 
     elif mode == "속성만 합치기(도형·개수 유지)":
         shp_layers = [layer for layer in layers if layer.kind == "SHP" and layer.has_dbf]
@@ -1476,10 +1730,11 @@ def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
         if output_format == "SHP":
             st.caption("⚠️ SHP는 컬럼명이 짧게 잘릴 수 있어요(한글 3~5자). 새 컬럼명을 온전히 두려면 **GPKG** 저장을 권장합니다.")
 
-        if st.button("실행 (도형 유지)", type="primary"):
+        if st.button("실행 (도형 유지)", type="primary", disabled=not (agg_map or agg_add_area)):
+            clear_result("merge_agg")
             if not agg_map and not agg_add_area:
                 st.warning("‘면적 계산’을 켜거나, ‘합칠 속성 고르기’에서 최소 1개를 `제외`가 아닌 값으로 바꿔 주세요.")
-                st.stop()
+                return
             if out_dir.exists():
                 shutil.rmtree(out_dir)
             out_dir.mkdir(parents=True)
@@ -1488,26 +1743,31 @@ def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
             ok, out_path, log, new_cols = aggregate_keep_geometry(
                 layer, column, out_path, output_format, encoding, target_epsg or None, agg_map,
                 bool(agg_add_area), int(agg_area_dec), output_encoding)
+            payload = {
+                "success": [], "info": [], "warning": [], "error": [],
+                "paths": [str(out_path)] if ok else [],
+                "log": log or "로그 없음",
+                "log_name": "merge_agg_log.txt",
+                "log_expanded": not ok,
+            }
             if ok:
                 after_n = ogr_layer_stats(out_path).get("features")
-                st.success(f"완료 — 추가된 컬럼: {', '.join(new_cols) if new_cols else '없음'}")
+                payload["success"].append(f"완료 — 추가된 컬럼: {', '.join(new_cols) if new_cols else '없음'}")
                 if isinstance(before_n, int) and isinstance(after_n, int):
                     if before_n == after_n:
-                        st.info(f"✅ 폴리곤 개수 그대로 유지: {before_n} → {after_n} (도형 안 바뀜)")
+                        payload["info"].append(f"✅ 폴리곤 개수 그대로 유지: {before_n} → {after_n} (도형 안 바뀜)")
                     else:
-                        st.error(f"⚠️ 개수가 달라졌습니다: {before_n} → {after_n}. 로그를 확인하세요.")
+                        payload["error"].append(f"⚠️ 개수가 달라졌습니다: {before_n} → {after_n}. 로그를 확인하세요.")
                 if out_path.suffix.lower() == ".gpkg" and output_format == "SHP":
-                    st.warning("SHP 저장에 실패해 GPKG로 대체 저장했습니다(QGIS에서 동일하게 열립니다).")
-                filename, data = download_for_path(out_path)
-                st.download_button("결과 다운로드", data, filename)
+                    payload["warning"].append("SHP 저장에 실패해 GPKG로 대체 저장했습니다(QGIS에서 동일하게 열립니다).")
             else:
-                st.error("실패")
-            render_log_problems(log or "")
-            st.code(log or "로그 없음")
-            st.download_button("작업 로그 다운로드", log or "로그 없음", "merge_agg_log.txt", key="merge_agg_log_dl")
+                payload["error"].append("실패")
+            save_result("merge_agg", payload)
+
+        render_result("merge_agg")
 
     else:
-        labels = st.multiselect("병합할 레이어", layer_options(layers), default=layer_options(layers), key="merge_many_layers")
+        labels = checkbox_picker("병합할 레이어", layer_options(layers), key="merge_many_pick")
         preview = selected_layers(labels, layers)
         if preview:
             rows = [{"레이어": item.name,
@@ -1533,7 +1793,8 @@ def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
                     "한 파일에 담지 못해 다른 타입이 통째로 버려집니다. **손실 없이 담기 위해 "
                     "GPKG로 저장합니다.**"
                 )
-        if st.button("여러 레이어 병합 실행", type="primary"):
+        if st.button("여러 레이어 병합 실행", type="primary", disabled=len(labels) < 2):
+            clear_result("merge_many")
             chosen = selected_layers(labels, layers)
             if len(chosen) < 2:
                 st.warning("두 개 이상 레이어를 선택하세요.")
@@ -1543,27 +1804,33 @@ def render_merge_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
             out_dir.mkdir(parents=True)
             out_path = output_dataset_path(out_dir, "merged_layers", output_format)
             ok, out_path, log = merge_layers(chosen, out_path, output_format, target_epsg or None, encoding, output_encoding, makevalid)
+            payload = {
+                "success": [], "warning": [], "error": [], "caption": [],
+                "paths": [str(out_path)] if ok else [],
+                "log": log or "로그 없음",
+                "log_name": "merge_layers_log.txt",
+                "log_expanded": not ok,
+            }
             if ok:
-                st.success("병합 완료")
+                payload["success"].append("병합 완료")
                 if out_path.suffix.lower() == ".gpkg" and output_format == "SHP":
-                    st.warning("SHP 저장에 실패해 GPKG로 대체 저장했습니다(QGIS에서 동일하게 열립니다).")
-                filename, data = download_for_path(out_path)
-                st.download_button("결과 다운로드", data, filename)
+                    payload["warning"].append("SHP 저장에 실패해 GPKG로 대체 저장했습니다(QGIS에서 동일하게 열립니다).")
                 total = sum(int(ogr_layer_stats(item.path, encoding, item.sublayer).get("features", 0) or 0) for item in chosen)
                 merged_n = ogr_layer_stats(out_path).get("features")
                 if merged_n is not None:
-                    st.caption(f"입력 feature 합계: {total} → 병합 결과: {merged_n}")
+                    payload["caption"].append(f"입력 feature 합계: {total} → 병합 결과: {merged_n}")
             else:
-                st.error("병합 실패")
-            render_log_problems(log or "")
-            st.code(log or "로그 없음")
-            st.download_button("작업 로그 다운로드", log or "로그 없음", "merge_layers_log.txt", key="merge_many_log_dl")
+                payload["error"].append("병합 실패")
+            save_result("merge_many", payload)
+
+        render_result("merge_many")
 
 
 def render_split_tab(layers: list[LayerInfo], encoding: str, output_encoding: str) -> None:
     st.subheader("레이어 분할")
     if not layers:
-        st.stop()
+        st.info("왼쪽에서 파일을 올린 뒤 사용할 수 있습니다.")
+        return
     mode = st.radio("분할 방식", ["한 SHP 내 컬럼값 기준 분할", "여러 레이어 분할"], horizontal=True)
     target_epsg = st.text_input("분할 결과 목표 EPSG(선택)", value="", key="split_target").strip()
     output_format = st.radio("결과 저장 형식", ["SHP", "GPKG"], horizontal=True, key="split_format")
@@ -1579,7 +1846,7 @@ def render_split_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
     if mode == "한 SHP 내 컬럼값 기준 분할":
         targets = [st.selectbox("대상 SHP", shp_layers, format_func=lambda item: item.name, key="split_one")]
     else:
-        labels = st.multiselect("분할할 SHP 레이어", [layer.name for layer in shp_layers], default=[layer.name for layer in shp_layers])
+        labels = checkbox_picker("분할할 SHP 레이어", [layer.name for layer in shp_layers], key="split_many_pick")
         targets = [layer for layer in shp_layers if layer.name in labels]
 
     first = targets[0] if targets else shp_layers[0]
@@ -1594,7 +1861,8 @@ def render_split_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
     )
     st.caption(f"감지된 값 예시: {', '.join(detected_values[:10]) if detected_values else '없음'}")
 
-    if st.button("분할 실행", type="primary"):
+    if st.button("분할 실행", type="primary", disabled=not targets):
+        clear_result("split")
         values = [line.strip() for line in value_text.splitlines() if line.strip()] or detected_values
         if not values:
             st.warning("분할할 값을 찾지 못했습니다.")
@@ -1623,22 +1891,30 @@ def render_split_tab(layers: list[LayerInfo], encoding: str, output_encoding: st
             )
             all_outputs.extend(outputs)
             logs.append(f"## {layer.name}\n{log}")
+        payload = {
+            "success": [], "error": [],
+            "paths": [str(p) for p in all_outputs],
+            "zip_name": "split.zip" if all_outputs else None,
+            "download_label": "분할 결과 전체 다운로드(zip)",
+            "log": "\n\n".join(logs) or "로그 없음",
+            "log_name": "split_log.txt",
+            "log_expanded": not all_outputs,
+        }
         if all_outputs:
-            st.success(f"{len(all_outputs)}개 결과 생성")
-            st.download_button("분할 결과 전체 다운로드(zip)", zip_paths(all_outputs, "split.zip"), "split.zip")
+            payload["success"].append(f"{len(all_outputs)}개 결과 생성")
         else:
-            st.error("분할 결과가 없습니다.")
-        log_text = "\n\n".join(logs) or "로그 없음"
-        with st.expander("처리 로그", expanded=not all_outputs):
-            st.code(log_text)
-        st.download_button("작업 로그 다운로드", log_text, "split_log.txt", key="split_log_dl")
+            payload["error"].append("분할 결과가 없습니다.")
+        save_result("split", payload)
+
+    render_result("split")
 
 
 def render_join_tab(layers: list[LayerInfo], encoding: str, output_encoding: str) -> None:
     st.subheader("코드 결합")
     st.caption("SHP 속성의 MNUM 같은 컬럼에서 substr로 코드를 뽑아 용도지역 코드표(CSV)를 결합합니다. 원본 DBF를 직접 고치지 않고 결합된 새 SHP/GPKG를 만듭니다.")
     if not layers:
-        st.stop()
+        st.info("왼쪽에서 파일을 올린 뒤 사용할 수 있습니다.")
+        return
     shp_layers = [layer for layer in layers if layer.kind == "SHP" and layer.has_dbf]
     if not shp_layers:
         st.warning("DBF가 있는 SHP 레이어가 필요합니다.")
@@ -1716,11 +1992,11 @@ def render_join_tab(layers: list[LayerInfo], encoding: str, output_encoding: str
     code_cols = list(code_df.columns)
     key_default = next((i for i, c in enumerate(code_cols) if any(k in c.lower() for k in ["code", "코드", "ucode"])), 0)
     join_key_col = st.selectbox("코드표의 조인 키 컬럼(6자리 코드)", code_cols, index=key_default, key="join_keycol")
-    value_cols = st.multiselect(
+    value_cols = checkbox_picker(
         "결합할 코드표 컬럼(속성에 붙일 값)",
         [c for c in code_cols if c != join_key_col],
-        default=[c for c in code_cols if c != join_key_col],
-        key="join_valcols",
+        key="join_valcols_pick",
+        ncols=4,
     )
     output_format = st.radio("결과 저장 형식", ["SHP", "GPKG"], horizontal=True, key="join_format")
 
@@ -1744,6 +2020,7 @@ def render_join_tab(layers: list[LayerInfo], encoding: str, output_encoding: str
         return
 
     if st.button("코드 결합 실행", type="primary"):
+        clear_result("join")
         out_dir = session_root() / "codejoin"
         if out_dir.exists():
             shutil.rmtree(out_dir)
@@ -1756,29 +2033,35 @@ def render_join_tab(layers: list[LayerInfo], encoding: str, output_encoding: str
             layer, mnum_col, int(start), int(length), code_csv, join_key_col, value_cols,
             out_path, output_format, encoding, output_encoding,
         )
+        payload = {
+            "success": [], "warning": [], "error": [], "caption": [],
+            "paths": [str(out_path)] if ok else [],
+            "log": log or "로그 없음",
+            "log_name": "codejoin_log.txt",
+            "log_expanded": not ok,
+        }
         if ok:
-            st.success("코드 결합 완료")
+            payload["success"].append("코드 결합 완료")
             if out_path.suffix.lower() == ".gpkg" and output_format == "SHP":
-                st.warning("SHP 저장에 실패해 GPKG로 대체 저장했습니다(QGIS에서 동일하게 열립니다).")
-            filename, data = download_for_path(out_path)
-            st.download_button("결과 다운로드", data, filename)
+                payload["warning"].append("SHP 저장에 실패해 GPKG로 대체 저장했습니다(QGIS에서 동일하게 열립니다).")
             try:
-                joined_preview = read_dbf_preview(out_path.with_suffix(".dbf"), output_encoding, limit=20) if out_path.suffix.lower() == ".shp" else None
-                if joined_preview is not None:
-                    st.caption("결합 결과 미리보기")
-                    st.dataframe(joined_preview, width="stretch", hide_index=True)
+                if out_path.suffix.lower() == ".shp":
+                    joined_preview = read_dbf_preview(out_path.with_suffix(".dbf"), output_encoding, limit=20)
+                    payload["caption"].append("결합 결과 미리보기")
+                    payload["table"] = joined_preview.to_dict("records")
             except Exception:
                 pass
         else:
-            st.error("코드 결합 실패. 로그를 확인하세요.")
-        with st.expander("처리 로그", expanded=not ok):
-            render_log_problems(log or "")
-            st.code(log or "로그 없음")
-        st.download_button("작업 로그 다운로드", log or "로그 없음", "codejoin_log.txt", key="join_log_dl")
+            payload["error"].append("코드 결합 실패. 로그를 확인하세요.")
+        save_result("join", payload)
+
+    render_result("join")
 
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
+    inject_css()
+    sweep_old_workspaces()
     st.title(APP_TITLE)
 
     with st.sidebar:

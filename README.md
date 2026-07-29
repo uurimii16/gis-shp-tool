@@ -202,6 +202,19 @@ SHP 좌표변환·병합·분할 도구
 
 공통 영역은 사이드바와 상단 확장 패널입니다.
 
+### 선택 UI 규칙(2026-07-29)
+
+- **여러 개 고르는 곳은 전부 체크박스 목록**입니다(`checkbox_picker`). 예전에는 `st.multiselect`를
+  써서 고른 항목이 색칠된 칩으로 바뀌고 지우기용 `×`가 붙었는데, "선택된 상태인지, 지우라는
+  뜻인지" 헷갈린다는 지적이 있었습니다. 체크박스는 켜짐/꺼짐이 그대로 보입니다.
+  목록 위에 `전체 선택` / `전체 해제` 버튼과 `선택됨 n / m개` 표시가 붙습니다.
+- **체크 표시는 앱이 CSS로 직접 그립니다**(`APP_CSS`). Streamlit 기본 체크 아이콘은 버전·테마·
+  브라우저에 따라 X나 빈칸으로 보이는 경우가 있어서, 기본 아이콘을 숨기고 파란 네모 + 흰색 ✓를
+  직접 그립니다. 글꼴이나 SVG 로딩에 의존하지 않으므로 어디서 열어도 같은 모양입니다.
+- **실행 결과는 세션에 저장해 계속 표시합니다**(`save_result` / `render_result`). 예전에는
+  `if st.button(...)` 블록 안에서 결과를 그려서, 사용자가 '결과 다운로드'를 누르는 순간
+  화면이 다시 실행되며 성공 메시지·통계표·로그가 통째로 사라졌습니다.
+
 ## 사이드바
 
 사이드바에는 다음 기능이 있습니다.
@@ -606,8 +619,14 @@ GPKG 결과:
 
 주요 함수:
 
-- `gdals()`: `ogr2ogr`, `ogrinfo` PATH 확인
+- `gdals()`: `ogr2ogr`, `ogrinfo` PATH 확인(결과는 10분 캐시 — 화면 조작마다 Program Files를 다시 뒤지지 않도록)
 - `run_cmd(args)`: GDAL 명령 실행
+- `file_token(path)`: 캐시 무효화용 파일 지문 `(경로, 수정시각, 크기)`
+- `cached_probe(token, args)`: 파일 조사용 `ogrinfo` 호출 캐시
+- `inject_css()` / `APP_CSS`: 체크박스 등 공통 스타일 주입
+- `checkbox_picker(...)`: 체크박스 목록 다중 선택 위젯
+- `save_result` / `render_result` / `clear_result`: 실행 결과 세션 보존·재표시
+- `sweep_old_workspaces()`: 12시간 지난 `.runtime/shp_tool_*` 세션 폴더 정리
 - `session_root()`: Streamlit 세션별 임시 작업 폴더 생성
 - `reset_workspace()`: 작업 폴더 초기화
 - `save_uploads(files)`: 업로드 파일 저장 및 zip 압축 해제
