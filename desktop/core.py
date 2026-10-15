@@ -735,6 +735,38 @@ def unique_values(layer: LayerInfo, column: str, encoding: str, limit: int = 200
     return sorted({value.strip() for value in values if value.strip() and value.strip() != "(null)"})
 
 
+def value_counts(layer: LayerInfo, column: str, encoding: str) -> dict[str, int]:
+    """기준 컬럼의 값마다 몇 개의 도형이 있는지 세어 돌려줍니다.
+
+    분할 [미리보기]에서 '이 낱말을 넣으면 몇 개가 걸리는지'를 실행 전에 보여 주는 데 씁니다.
+    """
+    _, ogrinfo = gdals()
+    if not ogrinfo:
+        return {}
+    src_layer = layer.sublayer or layer.path.stem
+    sql = (f"SELECT {quote_ident(column)} AS v, COUNT(*) AS n "
+           f"FROM {quote_ident(src_layer)} GROUP BY {quote_ident(column)}")
+    args = [ogrinfo, "-q", "-dialect", "SQLite", "-sql", sql]
+    if layer.kind == "SHP" and encoding:
+        args += ["-oo", f"ENCODING={encoding}"]
+    ok, output = run_cmd(args + [str(layer.path)])
+    if not ok:
+        return {}
+    counts: dict[str, int] = {}
+    current: dict[str, str] = {}
+    for line in output.splitlines() + ["OGRFeature"]:
+        if line.startswith("OGRFeature"):
+            value, number = current.get("v"), current.get("n")
+            if value and value != "(null)" and number and number.isdigit():
+                counts[value.strip()] = int(number)
+            current = {}
+            continue
+        match = re.match(r"^\s*(v|n)\s*\([^)]*\)\s*=\s*(.*)$", line)
+        if match:
+            current[match.group(1)] = match.group(2).strip()
+    return counts
+
+
 # ────────────────────────────── CSV 코드표 ──────────────────────────────
 def read_csv_table(raw: bytes, encoding: str) -> Table:
     """코드표 CSV를 지정 인코딩으로 읽습니다. 모든 값은 문자열(앞자리 0 보존).
@@ -1073,6 +1105,61 @@ def add_area_column(
     return ok, (actual if ok else src_path), log
 
 
+def overlap_report(
+    path: Path,
+    column: str,
+    encoding: str | None = None,
+    sum_field: str = "area_m2",
+    uni_field: str = "area_uni",
+) -> list[dict[str, object]]:
+    """병합 결과에서 '개별 면적 합계'와 '합친 도형의 실제 면적'을 그룹별로 읽어 옵니다.
+
+    두 값이 다르면 그 차이가 곧 **겹친 면적**입니다(합계는 겹친 부분을 2번 세고,
+    합친 도형 면적은 1번만 세기 때문). 무거운 위상 검사 없이 겹침을 진단할 수 있습니다.
+    슬리버(인접 도형 사이의 틈)는 두 값 모두 세지 않으므로 이 방법으로는 안 잡힙니다.
+    """
+    _, ogrinfo = gdals()
+    if not ogrinfo:
+        return []
+    layer_name, _ = resolve_layer_and_geom(path)
+    sql = (f"SELECT {quote_ident(column)}, {quote_ident(sum_field)}, {quote_ident(uni_field)} "
+           f"FROM {quote_ident(layer_name)}")
+    args = [ogrinfo, "-q", "-dialect", "SQLite", "-sql", sql]
+    if path.suffix.lower() == ".shp" and encoding:
+        args += ["-oo", f"ENCODING={encoding}"]
+    ok, output = run_cmd(args + [str(path)])
+    if not ok:
+        return []
+
+    def as_float(text: str) -> float | None:
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            return None
+
+    rows: list[dict[str, object]] = []
+    current: dict[str, str] = {}
+    for line in output.splitlines() + ["OGRFeature"]:      # 마지막 블록도 비우도록 보초값 추가
+        if line.startswith("OGRFeature"):
+            group, total, union = current.get(column), current.get(sum_field), current.get(uni_field)
+            total_f, union_f = as_float(total or ""), as_float(union or "")
+            if group and total_f is not None and union_f is not None:
+                gap = total_f - union_f
+                rows.append({
+                    "값": group,
+                    "합계": total_f,
+                    "합친도형": union_f,
+                    "차이": gap,
+                    "차이비율": (gap / union_f * 100) if union_f else 0.0,
+                })
+            current = {}
+            continue
+        match = re.match(r"^\s*(\S+)\s*\([^)]*\)\s*=\s*(.*)$", line)
+        if match:
+            current[match.group(1)] = match.group(2).strip()
+    return rows
+
+
 # ────────────────────────────── ① 좌표계 변환 ──────────────────────────────
 def convert_layer(
     layer: LayerInfo,
@@ -1169,13 +1256,21 @@ def dissolve_one_layer(
     target_epsg: str | None,
     agg_map: dict[str, str] | None = None,
     output_encoding: str = "UTF-8",
+    add_area: bool = False,
+    area_decimals: int = 1,
 ) -> tuple[bool, Path, str]:
     """한 레이어 안에서 컬럼값 기준 병합(dissolve).
 
     도형 깨짐(경계선 스파이크) 방지를 위해 항상 2단계로 처리합니다.
-      ① 원본 도형을 -makevalid로 복구해 UTF-8 GPKG 생성 (재투영 없이 네이티브 좌표).
-      ② 복구된 GPKG에서 ST_Union ... GROUP BY 로 병합 (+ 필요 시 재투영, 최종 -makevalid).
+      ① 원본 도형을 도형 수정(-makevalid)으로 고쳐 UTF-8 GPKG 생성. 면적을 목표
+         좌표계에서 재야 하므로 재투영(-t_srs)도 여기서 함께 합니다.
+      ② 고쳐진 GPKG에서 ST_Union ... GROUP BY 로 병합 (+ 최종 도형 수정).
     union은 인접 폴리곤의 '공유 내부 경계'만 지우고 바깥 윤곽선은 그대로 유지합니다.
+
+    면적(add_area)은 **합치기 전 개별 도형 면적의 합계**(SUM(ST_Area))로 냅니다.
+    조서·대장 면적과 맞추기 위해서입니다. 병합된 도형 자체의 면적(겹침을 1번만 세는
+    값)은 호출 측에서 add_area_column(field_name="area_uni")로 따로 붙입니다.
+    두 값의 차이가 곧 '겹친 면적'이라 겹침 진단에 씁니다.
     """
     ogr2ogr, _ = gdals()
     if not ogr2ogr:
@@ -1189,27 +1284,35 @@ def dissolve_one_layer(
             "-lco", "GEOMETRY_NAME=geometry", "-makevalid", "-nlt", "PROMOTE_TO_MULTI"]
     if layer.kind == "SHP" and input_encoding:
         args += ["-oo", f"ENCODING={input_encoding}"]
+    if target_epsg:
+        args += ["-t_srs", f"EPSG:{target_epsg}"]   # 면적을 목표 좌표계에서 재기 위해 먼저 재투영
     args += [str(repaired), *ogr_source_args(layer)]
     ok, log1 = run_cmd(args)
     if not ok:
-        return False, out_path, f"[① 도형복구 실패] {log1}"
+        return False, out_path, f"[① 도형수정/재투영 실패] {log1}"
 
+    dec = max(int(area_decimals), 0)
+    area_fields: dict[str, int] = {}
     select_parts = [quote_ident(column), "ST_Union(geometry) AS geometry"]
+    if add_area:
+        # 합치기 전 개별 면적의 합계. ST_Area(ST_Union(...))이 아님에 주의.
+        select_parts.append(f"ROUND(SUM(ST_Area(geometry)), {dec}) AS {quote_ident('area_m2')}")
+        area_fields["area_m2"] = dec
     for col, func in (agg_map or {}).items():
         if col == column or not func:
             continue
         select_parts.append(f"{func}({quote_ident(col)}) AS {quote_ident(col)}")
     sql = (f"SELECT {', '.join(select_parts)} FROM {quote_ident('src')} "
            f"GROUP BY {quote_ident(column)}")
+    # 재투영은 ①에서 이미 끝났으므로 여기서는 하지 않습니다.
     extra: list[str] = ["-nlt", "PROMOTE_TO_MULTI", "-makevalid"]
-    if target_epsg:
-        extra += ["-t_srs", f"EPSG:{target_epsg}"]
     ok2, actual, log2 = sqlite_sql_to_output(
         repaired, sql, out_path, output_format, output_encoding,
         oo_encoding=None,  # 복구본은 이미 UTF-8 GPKG
         extra_args=extra,
+        decimal_fields=(area_fields or None),
     )
-    return ok2, actual, f"[① 도형복구] {log1}\n[② 병합] {log2}".strip()
+    return ok2, actual, f"[① 도형수정/재투영] {log1}\n[② 병합] {log2}".strip()
 
 
 def aggregate_keep_geometry(
@@ -1272,11 +1375,15 @@ def aggregate_keep_geometry(
         # 컬럼명은 ASCII로(SHP 10바이트 필드명 제한에서 한글이 잘려 값이 깨지는 것 방지)
         a_each = uniq("area_m2")
         main_selects.append(f"ROUND(ST_Area(s.geometry), {dec}) AS {quote_ident(a_each)}")
-        # 그룹 면적은 ST_Union으로 '실제 합쳐진 면적'(겹침 1번만 계산)
+        # 그룹 면적은 개별 면적의 '합계'(조서·대장 면적과 맞는 값). 겹친 부분은 2번 셉니다.
         a_sum = uniq("area_sum")
-        group_selects.append(f"ROUND(ST_Area(ST_Union(geometry)), {dec}) AS {quote_ident(a_sum)}")
+        group_selects.append(f"ROUND(SUM(ST_Area(geometry)), {dec}) AS {quote_ident(a_sum)}")
         group_out.append(a_sum)
-        area_fields = {a_each: dec, a_sum: dec}
+        # 참고값: 합쳤을 때의 실제 면적(겹친 부분을 1번만 셈). a_sum과 다르면 겹침이 있다는 뜻.
+        a_uni = uniq("area_uni")
+        group_selects.append(f"ROUND(ST_Area(ST_Union(geometry)), {dec}) AS {quote_ident(a_uni)}")
+        group_out.append(a_uni)
+        area_fields = {a_each: dec, a_sum: dec, a_uni: dec}
 
     for col, func in picked.items():
         name = uniq(f"{col}_{AGG_SUFFIX.get(func, func)}")

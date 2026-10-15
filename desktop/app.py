@@ -291,6 +291,9 @@ class ShpToolApp(BASE_TK):
         style.configure("Card.TLabel", background=CARD, foreground=INK, font=base)
         style.configure("Muted.TLabel", background=CARD, foreground=MUTED, font=(UI_FONT, 9))
         style.configure("Head.TLabel", background=CARD, foreground=INK, font=(UI_FONT, 11, "bold"))
+        # 놓치면 안 되는 안내(좌표계 없음·인코딩 불일치 등)는 색으로 눈에 띄게 합니다.
+        style.configure("Warn.TLabel", background=CARD, foreground="#c0392b", font=(UI_FONT, 9, "bold"))
+        style.configure("Good.TLabel", background=CARD, foreground="#1e7a46", font=(UI_FONT, 9))
         style.configure("TCheckbutton", background=CARD, foreground=INK, font=base)
         style.configure("TRadiobutton", background=CARD, foreground=INK, font=base)
         self._apply_check_indicator(style)
@@ -476,15 +479,14 @@ class ShpToolApp(BASE_TK):
         ttk.Label(area_row, text="※ 5186 같은 미터 좌표계에서만 ㎡가 정확합니다",
                   style="Muted.TLabel").pack(side="left", padx=10)
 
+        # 예전에는 '안전 변환 모드' 체크박스가 있었지만, 꺼서 얻는 이점이 없어 항상 켜진 방식으로
+        # 통일했습니다. 도형을 먼저 고친 뒤 좌표계를 바꾸고, 단계마다 도형 개수를 세어 검증합니다.
         safe_row = ttk.Frame(left, style="Card.TFrame")
         safe_row.pack(side="bottom", fill="x", pady=(6, 0))
-        self.convert_safe = tk.BooleanVar(value=True)
-        ttk.Checkbutton(safe_row, text="안전 변환 모드(권장): 도형 복구 2단계 + 전후 피처수 검증",
-                        variable=self.convert_safe, command=self._toggle_safe).pack(side="left")
-        self.convert_makevalid = tk.BooleanVar(value=False)
-        self.convert_makevalid_cb = ttk.Checkbutton(safe_row, text="도형 유효화(-makevalid)",
-                                                    variable=self.convert_makevalid, state="disabled")
-        self.convert_makevalid_cb.pack(side="left", padx=12)
+        ttk.Label(safe_row,
+                  text="※ 깨진 도형을 먼저 고친 다음(도형 수정) 좌표계를 바꿉니다. "
+                       "단계마다 도형 개수를 세어 사라진 것이 없는지 확인합니다. 항상 자동으로 수행됩니다.",
+                  style="Muted.TLabel", wraplength=560, justify="left").pack(side="left")
 
         fmt_row = ttk.Frame(left, style="Card.TFrame")
         fmt_row.pack(side="bottom", fill="x", pady=(6, 0))
@@ -494,6 +496,7 @@ class ShpToolApp(BASE_TK):
         ttk.Radiobutton(fmt_row, text="GPKG", value="GPKG", variable=self.convert_format).pack(side="left", padx=8)
 
         self.convert_list = self._layer_listbox(left)
+        self.convert_list.bind("<<ListboxSelect>>", lambda _e: self._update_prj_hint())
 
         row = 0
         ttk.Label(right, text="목표 좌표계", style="Card.TLabel").grid(row=row, column=0, sticky="w", pady=3)
@@ -518,13 +521,15 @@ class ShpToolApp(BASE_TK):
         ttk.Label(right, text="(.prj가 없거나 틀릴 때만 입력. 예: 5174)", style="Muted.TLabel")\
             .grid(row=row, column=0, columnspan=2, sticky="w")
 
+        # 좌표계 정보가 있는지 없는지를 실행 전에 눈으로 알 수 있게 합니다.
+        row += 1
+        self.convert_prj_label = ttk.Label(right, text="", style="Muted.TLabel",
+                                           wraplength=300, justify="left")
+        self.convert_prj_label.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
     def _toggle_custom_epsg(self) -> None:
         is_custom = core.COMMON_EPSG.get(self.convert_target.get()) == "custom"
         self.convert_custom_entry.configure(state="normal" if is_custom else "disabled")
-
-    def _toggle_safe(self) -> None:
-        self.convert_makevalid_cb.configure(state="disabled" if self.convert_safe.get() else "normal")
 
     # ────────────────────────── 탭 2: 병합 ──────────────────────────
     def _build_merge_tab(self) -> None:
@@ -548,8 +553,13 @@ class ShpToolApp(BASE_TK):
         self.merge_format = tk.StringVar(value="SHP")
         ttk.Radiobutton(common, text="SHP", value="SHP", variable=self.merge_format).pack(side="left", padx=4)
         ttk.Radiobutton(common, text="GPKG", value="GPKG", variable=self.merge_format).pack(side="left", padx=4)
+        # 이 체크박스는 '여러 레이어 이어붙이기'에만 쓰입니다. 나머지 두 방식은 도형 수정을
+        # 항상 자동으로 하므로, 그때는 숨겨서 눌러도 아무 일이 없는 상태를 없앱니다.
         self.merge_makevalid = tk.BooleanVar(value=False)
-        ttk.Checkbutton(common, text="도형 유효화(-makevalid)", variable=self.merge_makevalid).pack(side="left", padx=12)
+        self.merge_makevalid_cb = ttk.Checkbutton(
+            common, text="도형 수정 (QGIS의 [도형 수정]과 같은 기능)", variable=self.merge_makevalid)
+        self.merge_auto_fix_label = ttk.Label(
+            common, text="※ 도형 수정은 자동으로 수행됩니다", style="Muted.TLabel")
 
         body = ttk.Frame(tab, style="Card.TFrame")
         body.pack(fill="both", expand=True)
@@ -623,19 +633,27 @@ class ShpToolApp(BASE_TK):
         mode = self.merge_mode.get()
         self.merge_single.pack_forget()
         self.merge_multi.pack_forget()
+        # 이어붙이기에서만 도형 수정을 고를 수 있고, 나머지는 항상 자동입니다.
+        self.merge_makevalid_cb.pack_forget()
+        self.merge_auto_fix_label.pack_forget()
         if mode == "append":
+            self.merge_makevalid_cb.pack(side="left", padx=12)
             self.merge_multi.pack(fill="both", expand=True)
             return
+        self.merge_auto_fix_label.pack(side="left", padx=12)
         self.merge_single.pack(fill="both", expand=True)
         if mode == "dissolve":
             self.merge_hint.configure(
-                text="같은 값의 도형을 하나로 합칩니다. 바깥 윤곽선은 그대로 두고 인접 도형의 '공유 내부 경계'만 "
-                     "지웁니다(경계선 깨짐 방지를 위해 병합 전 도형 복구 자동 수행).")
+                text="같은 값을 가진 도형끼리 하나로 합칩니다. 바깥 윤곽선은 그대로 두고 맞닿은 도형 사이의 "
+                     "경계선만 지웁니다. 합치기 전에 깨진 도형을 자동으로 고칩니다(도형 수정).\n"
+                     "면적을 켜면 area_m2(합치기 전 개별 면적의 합계)와 area_uni(합쳐진 도형의 실제 면적)가 "
+                     "함께 들어갑니다. 두 값이 다르면 그만큼 도형이 겹쳐 있다는 뜻입니다.")
             self.agg_func_combo.configure(values=list(core.DISSOLVE_AGG_FUNCS.keys()))
         else:
             self.merge_hint.configure(
-                text="도형은 하나도 안 바뀝니다(개수·모양·경계선 그대로). 같은 기준값끼리 묶어 면적 합계·집계값만 "
-                     "새 컬럼으로 붙입니다. 정확한 ㎡를 원하면 위 '목표 EPSG 통일'에 5186을 넣으세요.")
+                text="도형은 하나도 바뀌지 않습니다(개수·모양·경계선 그대로). 같은 기준값끼리 묶어 "
+                     "면적 합계·집계값만 새 컬럼으로 붙입니다.\n"
+                     "정확한 ㎡를 얻으려면 위 '목표 EPSG 통일'에 5186 같은 미터 좌표계를 넣으세요.")
             self.agg_func_combo.configure(values=list(core.KEEP_AGG_FUNCS.keys()))
 
     def _apply_agg(self) -> None:
@@ -656,6 +674,34 @@ class ShpToolApp(BASE_TK):
             if func:
                 result[column] = func
         return result
+
+    def _log_overlap(self, path: Path, column: str, encoding: str,
+                     sum_field: str = "area_m2", uni_field: str = "area_uni") -> None:
+        """그룹별로 '개별 면적 합계'와 '합쳐진 도형의 실제 면적'을 나란히 보여 줍니다.
+
+        두 값의 차이가 곧 겹친 면적입니다. 차이가 없으면 겹치는 도형이 없다는 뜻입니다.
+        """
+        rows = core.overlap_report(path, column, encoding, sum_field, uni_field)
+        if not rows:
+            return
+        self.log(f"── 면적 확인 ({column} 기준 {len(rows)}개 그룹) ──")
+        overlapped = 0
+        for row in rows:
+            total, union = float(row["합계"]), float(row["합친도형"])
+            gap, ratio = float(row["차이"]), float(row["차이비율"])
+            head = f"   {row['값']} | 합계 {total:,.1f}㎡ | 합친도형 {union:,.1f}㎡"
+            if abs(ratio) < 0.001:
+                self.log(f"{head} | 차이 없음 ✅")
+            else:
+                overlapped += 1
+                self.log(f"{head} | 차이 {gap:+,.1f}㎡ ({ratio:+.2f}%) ⚠️")
+        if overlapped:
+            self.log(f"⚠️ {overlapped}개 그룹에서 두 면적이 다릅니다 = 그만큼 도형이 겹쳐 있습니다.")
+            self.log("   · area_m2(합계) — 조서·대장 면적과 맞추려면 이 값을 쓰세요. 겹친 부분을 2번 셉니다.")
+            self.log("   · area_uni(합친도형) — 실제 땅이 차지하는 면적. 겹친 부분을 1번만 셉니다.")
+            self.log("   원자료에 겹치는 폴리곤이 있는지 확인해 보세요.")
+        else:
+            self.log("✅ 두 면적이 모두 같습니다 — 겹치는 도형이 없습니다.")
 
     # ────────────────────────── 탭 3: 분할 ──────────────────────────
     def _build_split_tab(self) -> None:
@@ -690,21 +736,92 @@ class ShpToolApp(BASE_TK):
         opts2 = ttk.Frame(left, style="Card.TFrame")
         opts2.pack(fill="x", pady=(4, 0))
         self.split_contains = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts2, text="포함 조건으로 분할(%값% 방식)", variable=self.split_contains).pack(side="left")
+        ttk.Checkbutton(opts2, text="값의 일부만 같아도 묶기 (포함 조건)",
+                        variable=self.split_contains,
+                        command=self._toggle_split_contains).pack(side="left")
         self.split_makevalid = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts2, text="도형 유효화(-makevalid)", variable=self.split_makevalid).pack(side="left", padx=12)
+        ttk.Checkbutton(opts2, text="도형 수정 (QGIS의 [도형 수정]과 같은 기능)",
+                        variable=self.split_makevalid).pack(side="left", padx=12)
 
-        ttk.Button(right, text="분할 실행", style="Accent.TButton",
-                   command=self.run_split).pack(side="bottom", anchor="e", pady=(10, 0))
-        ttk.Label(right, text="분할할 값 (한 줄에 하나 · 비우면 감지된 전체 고유값)", style="Card.TLabel").pack(anchor="w")
+        self.split_mode_hint = ttk.Label(
+            left, text="", style="Muted.TLabel", wraplength=560, justify="left")
+        self.split_mode_hint.pack(anchor="w", pady=(6, 0))
+
+        # ── 오른쪽: 위 = 자료에 있는 값(읽기 전용 목록), 아래 = 실제로 쓸 값(직접 입력) ──
+        # 예전에는 이 둘이 한 칸에 섞여 있어서, [고유값 불러오기]가 채워 넣은 값을 '결과'로
+        # 오해하고 직접 입력할 수 있다는 것을 아무도 몰랐습니다.
+        button_row = ttk.Frame(right, style="Card.TFrame")
+        button_row.pack(side="bottom", fill="x", pady=(10, 0))
+        ttk.Button(button_row, text="분할 실행", style="Accent.TButton",
+                   command=self.run_split).pack(side="right")
+        ttk.Button(button_row, text="미리보기 (몇 개가 걸리는지 확인)",
+                   command=self.preview_split_values).pack(side="right", padx=(0, 8))
+
+        found_head = ttk.Frame(right, style="Card.TFrame")
+        found_head.pack(fill="x")
+        ttk.Label(found_head, text="자료에 들어 있는 값", style="Head.TLabel").pack(side="left")
+        ttk.Button(found_head, text="불러오기", command=self.load_split_values).pack(side="right")
+        ttk.Label(right, text="더블클릭하면 아래 '분할할 값'에 추가됩니다.",
+                  style="Muted.TLabel").pack(anchor="w", pady=(2, 4))
+        found_wrap = ttk.Frame(right, style="Card.TFrame")
+        found_wrap.pack(fill="both", expand=True)
+        self.split_found = tk.Listbox(found_wrap, height=6, bg=LOGBG, fg=INK, relief="flat",
+                                      font=(UI_FONT, 9), activestyle="none",
+                                      selectbackground=ACCENT, selectforeground="#ffffff")
+        found_scroll = ttk.Scrollbar(found_wrap, orient="vertical", command=self.split_found.yview)
+        self.split_found.configure(yscrollcommand=found_scroll.set)
+        self.split_found.pack(side="left", fill="both", expand=True)
+        found_scroll.pack(side="right", fill="y")
+        self.split_found.bind("<Double-Button-1>", lambda _e: self._add_found_value())
+
+        self.split_values_label = ttk.Label(right, text="", style="Head.TLabel")
+        self.split_values_label.pack(anchor="w", pady=(10, 0))
+        self.split_values_hint = ttk.Label(right, text="", style="Muted.TLabel",
+                                           wraplength=420, justify="left")
+        self.split_values_hint.pack(anchor="w", pady=(2, 4))
         text_wrap = ttk.Frame(right, style="Card.TFrame")
-        text_wrap.pack(fill="both", expand=True, pady=(4, 0))
-        self.split_values = tk.Text(text_wrap, height=8, bg=LOGBG, fg=INK, relief="flat",
+        text_wrap.pack(fill="both", expand=True)
+        self.split_values = tk.Text(text_wrap, height=6, bg=LOGBG, fg=INK, relief="flat",
                                     font=(UI_FONT, 9), insertbackground=INK)
         scroll = ttk.Scrollbar(text_wrap, orient="vertical", command=self.split_values.yview)
         self.split_values.configure(yscrollcommand=scroll.set)
         self.split_values.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+
+        self._toggle_split_contains()
+
+    def _toggle_split_contains(self) -> None:
+        """'포함 조건'을 켜고 끌 때 안내문을 바꿔, 무엇을 입력해야 하는지 알려 줍니다."""
+        if self.split_contains.get():
+            self.split_mode_hint.configure(
+                text="포함 조건: 입력한 낱말이 값 '안에 들어 있기만 하면' 모두 한 파일로 묶습니다.\n"
+                     "예를 들어 녹지 라고 입력하면 보전녹지지역·생산녹지지역·자연녹지지역이 "
+                     "전부 한 파일(…_녹지.shp)로 나옵니다.")
+            self.split_values_label.configure(text="분할할 값 — 낱말을 직접 입력하세요")
+            self.split_values_hint.configure(
+                text="한 줄에 하나씩 입력합니다. 위 목록의 값을 그대로 쓰지 말고, "
+                     "묶고 싶은 낱말만 쓰세요. 예: 녹지 / 주거 / 공업\n"
+                     "[미리보기]를 누르면 낱말마다 몇 개가 걸리는지 미리 확인할 수 있습니다.")
+        else:
+            self.split_mode_hint.configure(
+                text="값이 정확히 같은 것끼리만 묶어 파일을 나눕니다. "
+                     "값 하나마다 파일 하나가 만들어집니다.")
+            self.split_values_label.configure(text="분할할 값")
+            self.split_values_hint.configure(
+                text="한 줄에 하나씩 입력합니다. 위 목록에서 더블클릭해 넣어도 됩니다.\n"
+                     "비워 두면 자료에 있는 값 전부를 각각의 파일로 나눕니다.")
+
+    def _add_found_value(self) -> None:
+        """위 목록에서 고른 값을 아래 입력칸에 한 줄로 덧붙입니다."""
+        picked = [self.split_found.get(index) for index in self.split_found.curselection()]
+        if not picked:
+            return
+        current = [line.strip() for line in self.split_values.get("1.0", "end").splitlines() if line.strip()]
+        for value in picked:
+            if value not in current:
+                current.append(value)
+        self.split_values.delete("1.0", "end")
+        self.split_values.insert("1.0", "\n".join(current))
 
     # ────────────────────────── 탭 4: 코드 결합 ──────────────────────────
     def _build_join_tab(self) -> None:
@@ -1051,6 +1168,7 @@ class ShpToolApp(BASE_TK):
         self.layers.extend(added)
         self.refresh_layer_views()
         self.log(f"레이어 {len(added)}개 추가 (전체 {len(self.layers)}개)")
+        self.apply_cpg_encoding()
         if not added:
             self.log("추가된 레이어가 없습니다. SHP/GPKG가 들어있는지 확인하세요.")
         self.set_status("대기 중", 0)
@@ -1087,6 +1205,7 @@ class ShpToolApp(BASE_TK):
                 self.preview_layer.set(labels[0])
             self.split_list.selection_set(0)
             self._reload_split_columns()
+        self._update_prj_hint()
 
     def pick_out_dir(self) -> None:
         folder = filedialog.askdirectory(title="결과를 저장할 폴더")
@@ -1193,6 +1312,82 @@ class ShpToolApp(BASE_TK):
         if messagebox.askyesno("완료", f"{message}\n\n결과 폴더를 열까요?\n{out_dir}"):
             open_folder(out_dir)
 
+    def warn_lost_features(self, what: str, lines: list[str]) -> None:
+        """도형이 사라졌을 때 로그로만 흘려보내지 않고 창을 띄워 확실히 알립니다.
+
+        예전에는 로그에 한 줄 남기고 끝이라, 로그를 안 보면 모르고 지나갔습니다.
+        """
+        detail = "\n".join(lines)
+        self.log("")
+        self.log("=" * 58)
+        self.log(f"⚠️ 도형이 사라졌습니다 — {what}")
+        for line in lines:
+            self.log(f"   {line}")
+        self.log("   원인은 보통 둘 중 하나입니다.")
+        self.log("   (1) 원본 좌표계를 잘못 알고 있음 → '원본 EPSG 강제 지정'에 실제 좌표계를 넣고 다시 실행")
+        self.log("   (2) 원본 도형이 고칠 수 없을 만큼 깨져 있음 → QGIS에서 원본을 확인")
+        self.log("=" * 58)
+        self.after(0, lambda: messagebox.showwarning(
+            "도형이 사라졌습니다",
+            f"{what} 중에 도형 일부가 사라졌습니다.\n\n{detail}\n\n"
+            "원인은 보통 둘 중 하나입니다.\n\n"
+            "(1) 원본 좌표계를 잘못 알고 있는 경우\n"
+            "    → '원본 EPSG 강제 지정'에 실제 좌표계(예: 5174)를 넣고\n"
+            "       다시 실행해 보세요.\n\n"
+            "(2) 원본 도형이 고칠 수 없을 만큼 깨져 있는 경우\n"
+            "    → QGIS에서 원본 파일을 열어 확인해야 합니다.\n\n"
+            "자세한 내용은 처리 로그를 확인하세요."))
+
+    def apply_cpg_encoding(self) -> None:
+        """불러온 SHP 옆의 .cpg 파일에 적힌 인코딩을 입력 인코딩에 자동으로 맞춥니다.
+
+        .cpg는 그 SHP의 한글이 어떤 방식으로 저장됐는지 적어 둔 파일입니다. 이것과
+        다른 값을 쓰면 한글이 조용히 깨집니다(보전녹지지역 → 蹂댁쟾끃吏吏뿭).
+        예전에는 기본값 CP949가 그대로 쓰여서, UTF-8로 저장된 자료를 넣으면 깨졌습니다.
+        """
+        found = {layer.cpg.strip().upper().replace("-", "")
+                 for layer in self.layers if layer.kind == "SHP" and layer.cpg.strip()}
+        if not found:
+            return
+        alias = {"UTF8": "UTF-8", "CP949": "CP949", "EUCKR": "EUC-KR",
+                 "MS949": "CP949", "KSC5601": "EUC-KR", "ANSI": "CP949"}
+        picked = {alias[name] for name in found if name in alias}
+        current = self.in_enc.get()
+        if len(picked) == 1:
+            wanted = picked.pop()
+            if wanted != current:
+                self.in_enc.set(wanted)
+                self.log(f"ℹ️ 입력 인코딩을 {current} → {wanted} 로 자동 변경했습니다 "
+                         f"(불러온 SHP의 .cpg 파일에 {wanted}(으)로 적혀 있습니다).")
+                self.log("   한글이 깨져 보이면 이 값을 직접 바꿔 보세요.")
+        elif len(picked) > 1:
+            self.log(f"⚠️ 불러온 SHP들의 .cpg 인코딩이 서로 다릅니다: {', '.join(sorted(picked))}")
+            self.log(f"   지금은 {current}(으)로 처리합니다. 인코딩이 같은 것끼리 나눠서 실행하세요.")
+
+    def _update_prj_hint(self) -> None:
+        """선택한 레이어에 좌표계 정보(.prj)가 있는지 변환 탭에 표시합니다."""
+        picked = self.selected_layers(self.convert_list) or self.layers
+        shp = [layer for layer in picked if layer.kind == "SHP"]
+        missing = [layer for layer in shp if not layer.has_prj]
+        if not picked:
+            self.convert_prj_label.configure(text="", style="Muted.TLabel")
+            return
+        if missing:
+            names = ", ".join(layer.name for layer in missing[:2])
+            more = f" 외 {len(missing) - 2}개" if len(missing) > 2 else ""
+            self.convert_prj_label.configure(
+                style="Warn.TLabel",
+                text=(f"⚠️ 좌표계 정보(.prj)가 없습니다 — {names}{more}\n"
+                      "위 '원본 EPSG 강제 지정'에 원본 좌표계를 반드시 넣으세요.\n"
+                      "비워 두면 도형이 엉뚱한 곳에 찍히거나 사라집니다."))
+            return
+        epsgs = {core.layer_epsg(layer.path, layer.sublayer) or "?" for layer in picked}
+        shown = ", ".join(f"EPSG:{code}" for code in sorted(epsgs) if code != "?")
+        self.convert_prj_label.configure(
+            style="Good.TLabel",
+            text=(f"✅ 좌표계 정보가 모두 있습니다 ({shown or '확인됨'})\n"
+                  "'원본 EPSG 강제 지정'은 비워 두세요."))
+
     # ────────────────────────── 컬럼 로딩 ──────────────────────────
     def _reload_merge_columns(self) -> None:
         layer = self.layer_by_label(self.merge_layer.get())
@@ -1241,8 +1436,6 @@ class ShpToolApp(BASE_TK):
                 return
         source = self.convert_source.get().strip() or None
         fmt = self.convert_format.get()
-        safe = self.convert_safe.get()
-        makevalid = self.convert_makevalid.get()
         add_area = self.convert_area.get()
         decimals = int(self.convert_area_dec.get())
         in_enc, out_enc = self.in_enc.get(), self.out_enc.get()
@@ -1253,22 +1446,18 @@ class ShpToolApp(BASE_TK):
         def job() -> None:
             out_dir = stamped_dir(self.out_base(), "변환")
             results: list[Path] = []
-            dropped = False
-            # 레이어당 GDAL 명령 수: 안전 변환 2 + 면적 2(GPKG 경유 저장) — 어긋나도 자동 보정됩니다.
-            per_layer = (2 if safe else 1) + (2 if add_area else 0)
+            lost_layers: list[str] = []
+            # 레이어당 GDAL 명령 수: 도형수정 1 + 재투영 1 + 면적 2(GPKG 경유 저장) — 어긋나도 자동 보정됩니다.
+            per_layer = 2 + (2 if add_area else 0)
             core.PROGRESS.begin(len(layers) * per_layer, "좌표계 변환")
             for index, layer in enumerate(layers, start=1):
                 self.log(f"\n--- {layer.name} ({index}/{len(layers)}) ---")
                 before = core.ogr_layer_stats(layer.path, in_enc, layer.sublayer)
                 out_path = core.output_dataset_path(out_dir, f"{layer.name}_{target}", fmt)
-                if safe:
-                    ok, out_path, counts, _log = core.convert_layer_safe(
-                        layer, out_path, target, source, fmt, in_enc, out_enc)
-                    repaired = counts.get("복구후")
-                else:
-                    ok, out_path, _log = core.convert_layer(
-                        layer, out_path, target, source, fmt, in_enc, out_enc, makevalid)
-                    repaired = None
+                # 항상 2단계(도형 수정 → 재투영)로 처리하고 단계마다 개수를 셉니다.
+                ok, out_path, counts, _log = core.convert_layer_safe(
+                    layer, out_path, target, source, fmt, in_enc, out_enc)
+                repaired = counts.get("복구후")
                 if not ok:
                     self.log(f"❌ {layer.name}: 변환 실패")
                     continue
@@ -1280,13 +1469,12 @@ class ShpToolApp(BASE_TK):
                 before_n, after_n = before.get("features"), after.get("features")
                 lost = (before_n - after_n) if isinstance(before_n, int) and isinstance(after_n, int) else None
                 if lost:
-                    dropped = True
-                summary = f"변환 전 {before_n} → " + (f"복구후 {repaired} → " if repaired is not None else "") + f"변환 후 {after_n}"
+                    lost_layers.append(f"· {layer.name} : {before_n}개 → {after_n}개 ({lost}개 사라짐)")
+                summary = f"변환 전 {before_n} → " + (f"도형수정 후 {repaired} → " if repaired is not None else "") + f"변환 후 {after_n}"
                 self.log(f"✅ {out_path.name} | {summary} | 손실 " + (f"❌ -{lost}" if lost else "✅ 0"))
                 self.log(f"   범위: {before.get('extent', '-')}  →  {after.get('extent', '-')}")
-            if dropped:
-                self.log("⚠️ 사라진 피처가 있습니다. 보통 (1) 원본 좌표계 오판 또는 (2) 불량 도형이 원인입니다. "
-                         "'원본 EPSG 강제 지정'에 실제 좌표계(예: 5174)를 넣고 다시 시도하세요.")
+            if lost_layers:
+                self.warn_lost_features("좌표계 변환", lost_layers)
             if results:
                 self.finish(out_dir, f"{len(results)}개 레이어 변환 완료")
             else:
@@ -1316,20 +1504,34 @@ class ShpToolApp(BASE_TK):
             messagebox.showwarning("선택 필요", "'면적 컬럼 추가'를 켜거나, 집계할 속성을 1개 이상 고르세요.")
             return
 
+        if add_area:
+            area_epsg = epsg or core.layer_epsg(layer.path, layer.sublayer)
+            if area_epsg == "4326":
+                self.log("⚠️ EPSG:4326(경위도)은 면적이 ㎡가 아니라 제곱도로 계산됩니다. "
+                         "위 '목표 EPSG 통일'에 5186 등 미터 좌표계를 넣으세요.")
+
         def job() -> None:
             out_dir = stamped_dir(self.out_base(), "병합")
             if mode == "dissolve":
                 core.PROGRESS.begin(3 if add_area else 2, "도형 병합")
                 out_path = core.output_dataset_path(out_dir, f"{layer.name}_dissolved_by_{column}", fmt)
                 before_n = core.ogr_layer_stats(layer.path, in_enc, layer.sublayer).get("features")
+                # 면적(area_m2)은 병합 전 개별 도형 면적의 합계로 dissolve 안에서 계산됩니다.
                 ok, out_path, _log = core.dissolve_one_layer(
-                    layer, column, out_path, fmt, in_enc, epsg, agg_map, out_enc)
-                if ok and add_area:
-                    area_ok, out_path, _ = core.add_area_column(out_path, fmt, out_enc, decimals)
-                    self.log("면적 컬럼 추가 " + ("완료(area_m2)" if area_ok else "실패 — 로그 확인"))
+                    layer, column, out_path, fmt, in_enc, epsg, agg_map, out_enc, add_area, decimals)
                 if not ok:
                     self.log("❌ 병합 실패 — 로그를 확인하세요.")
                     return
+                if add_area:
+                    # 참고값: 합쳐진 도형 자체의 면적(겹친 부분을 1번만 셈)
+                    uni_ok, out_path, _ = core.add_area_column(
+                        out_path, fmt, out_enc, decimals, field_name="area_uni")
+                    if uni_ok:
+                        self.log("면적 컬럼 추가 완료 — area_m2(합치기 전 개별 면적의 합계), "
+                                 "area_uni(합쳐진 도형의 실제 면적)")
+                        self._log_overlap(out_path, column, out_enc)
+                    else:
+                        self.log("⚠️ area_uni(합쳐진 도형 면적) 추가 실패 — area_m2만 들어갔습니다.")
                 after_n = core.ogr_layer_stats(out_path).get("features")
                 self.log(f"✅ {out_path.name} | 피처 {before_n} → {after_n} (같은 '{column}' 값끼리 하나로 합쳐짐)")
                 self.finish(out_dir, "컬럼값 기준 병합 완료")
@@ -1345,6 +1547,14 @@ class ShpToolApp(BASE_TK):
                 return
             after_n = core.ogr_layer_stats(out_path).get("features")
             self.log(f"✅ {out_path.name} | 추가된 컬럼: {', '.join(new_cols) if new_cols else '없음'}")
+            if add_area:
+                sum_f = next((c for c in new_cols if c.startswith("area_sum")), None)
+                uni_f = next((c for c in new_cols if c.startswith("area_uni")), None)
+                self.log("   area_m2 = 이 도형 하나의 면적 / "
+                         f"{sum_f or 'area_sum'} = 같은 값끼리 개별 면적을 더한 합계 / "
+                         f"{uni_f or 'area_uni'} = 합쳤을 때의 실제 면적")
+                if sum_f and uni_f:
+                    self._log_overlap(out_path, column, out_enc, sum_f, uni_f)
             if isinstance(before_n, int) and isinstance(after_n, int):
                 if before_n == after_n:
                     self.log(f"✅ 폴리곤 개수 그대로 유지: {before_n} → {after_n} (도형 안 바뀜)")
@@ -1389,15 +1599,68 @@ class ShpToolApp(BASE_TK):
             return
 
         def job() -> None:
-            values = core.unique_values(layers[0], column, self.in_enc.get())
-            def apply() -> None:
-                self.split_values.delete("1.0", "end")
-                self.split_values.insert("1.0", "\n".join(values))
-            self.after(0, apply)
-            self.log(f"'{column}' 고유값 {len(values)}개를 불러왔습니다: {', '.join(values[:10])}"
-                     + (" …" if len(values) > 10 else ""))
+            counts = core.value_counts(layers[0], column, self.in_enc.get())
+            values = sorted(counts) or core.unique_values(layers[0], column, self.in_enc.get())
 
-        self.run_task("고유값 불러오기", job)
+            def apply() -> None:
+                self.split_found.delete(0, "end")
+                for value in values:
+                    number = counts.get(value)
+                    self.split_found.insert("end", f"{value}   ({number}개)" if number else value)
+            self.after(0, apply)
+            self.log(f"'{column}'에 들어 있는 값 {len(values)}개를 찾았습니다.")
+            for value in values[:20]:
+                self.log(f"   {value}  —  {counts.get(value, '?')}개")
+            if len(values) > 20:
+                self.log(f"   … 외 {len(values) - 20}개")
+            self.log("   쓰고 싶은 값을 목록에서 더블클릭하면 '분할할 값'에 들어갑니다.")
+
+        self.run_task("값 불러오기", job)
+
+    def preview_split_values(self) -> None:
+        """실행하기 전에, 입력한 값마다 도형이 몇 개 걸리는지 미리 보여 줍니다."""
+        layers = self.selected_layers(self.split_list)
+        column = self.split_column.get()
+        if not layers or not column:
+            messagebox.showwarning("선택 필요", "레이어와 기준 컬럼을 먼저 고르세요.")
+            return
+        typed = [line.strip() for line in self.split_values.get("1.0", "end").splitlines() if line.strip()]
+        contains = self.split_contains.get()
+        in_enc = self.in_enc.get()
+
+        def job() -> None:
+            counts = core.value_counts(layers[0], column, in_enc)
+            if not counts:
+                self.log("⚠️ 값을 읽지 못했습니다. 기준 컬럼을 확인하세요.")
+                return
+            targets = typed or sorted(counts)
+            mode = "값의 일부만 같아도 묶기" if contains else "값이 정확히 같은 것만"
+            self.log(f"\n── 미리보기 ({layers[0].name} · {column} · {mode}) ──")
+            lines: list[str] = []
+            empty: list[str] = []
+            for value in targets:
+                if contains:
+                    hit = {name: number for name, number in counts.items() if value in name}
+                else:
+                    hit = {value: counts[value]} if value in counts else {}
+                total = sum(hit.values())
+                if not total:
+                    empty.append(value)
+                    self.log(f"   ❌ {value} → 걸리는 도형이 없습니다")
+                    continue
+                lines.append(f"{value} → {total}개")
+                self.log(f"   ✅ {value} → 도형 {total}개 · 파일 1개 (…_{core.safe_name(value)})")
+                if contains and len(hit) > 1:
+                    for name, number in sorted(hit.items()):
+                        self.log(f"        └ {name} ({number}개)")
+            summary = "\n".join(lines) or "걸리는 값이 하나도 없습니다."
+            tail = ("\n\n걸리는 것이 없는 값:\n" + ", ".join(empty)) if empty else ""
+            self.after(0, lambda: messagebox.showinfo(
+                "미리보기",
+                f"기준 컬럼: {column}\n조건: {mode}\n\n{summary}{tail}\n\n"
+                f"이대로 실행하면 파일 {len(lines)}개가 만들어집니다."))
+
+        self.run_task("미리보기", job)
 
     def run_split(self) -> None:
         layers = self.selected_layers(self.split_list)
@@ -1406,9 +1669,16 @@ class ShpToolApp(BASE_TK):
             messagebox.showwarning("선택 필요", "레이어와 기준 컬럼을 고르세요.")
             return
         typed = [line.strip() for line in self.split_values.get("1.0", "end").splitlines() if line.strip()]
+        contains = self.split_contains.get()
+        if contains and not typed:
+            messagebox.showwarning(
+                "입력 필요",
+                "'값의 일부만 같아도 묶기'를 켜면 묶을 낱말을 직접 입력해야 합니다.\n\n"
+                "오른쪽 아래 '분할할 값' 칸에 한 줄에 하나씩 넣으세요.\n"
+                "예: 녹지  →  보전녹지지역·생산녹지지역·자연녹지지역이 한 파일로 묶입니다.")
+            return
         epsg = self.split_epsg.get().strip() or None
         fmt = self.split_format.get()
-        contains = self.split_contains.get()
         makevalid = self.split_makevalid.get()
         in_enc, out_enc = self.in_enc.get(), self.out_enc.get()
 
